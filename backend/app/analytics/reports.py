@@ -15,7 +15,7 @@ from datetime import date, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.budget_rule import Bucket, bucket_for
-from app.domain.income_periods import GRACE_DAYS, attributed_month, detect_cadence
+from app.domain.income_periods import MAX_SHIFT_DAYS, attributed_month, fit_schedule
 from app.repositories.transactions import TransactionRepository
 from app.schemas.common import cents_to_dollars
 from app.schemas.dashboard import CategorySpend
@@ -39,7 +39,7 @@ def _shift_months(anchor: date, back: int) -> date:
     return date(idx // 12, idx % 12 + 1, 1)
 
 
-# How much history to look back over when inferring the pay cadence. Long
+# How much history to look back over when fitting the pay schedule. Long
 # enough to see a dozen bi-weekly cheques, so one odd month can't flip it.
 CADENCE_HISTORY_DAYS = 180
 
@@ -53,29 +53,32 @@ class ReportsService:
     ) -> dict[tuple[int, int], int]:
         """Income cents keyed by the ``(year, month)`` it's attributed to.
 
-        Bi-weekly pay doesn't divide evenly into calendar months, so a cheque
-        landing on the 1st is usually the previous month's — see
-        :mod:`app.domain.income_periods`. Looks back far enough to infer the
-        cadence, and forward past ``end`` so a deposit in the first days of the
-        *following* month can be pulled back into the requested range.
+        Bi-weekly pay doesn't divide evenly into calendar months, and a deposit
+        gets moved off its payday whenever that payday falls on a weekend or a
+        holiday. So each deposit is counted in the month of the payday it was
+        paid *against* — see :mod:`app.domain.income_periods`.
+
+        Looks back far enough to fit the schedule, and pads both ends of the
+        range by ``MAX_SHIFT_DAYS`` so a deposit that cleared just outside the
+        requested months can still be attributed into them.
         """
         rows = await self.txns.income_rows(
             user_id,
             start - timedelta(days=CADENCE_HISTORY_DAYS),
-            end + timedelta(days=GRACE_DAYS),
+            end + timedelta(days=MAX_SHIFT_DAYS),
         )
-        cadence = detect_cadence([on for on, _cents in rows])
+        schedule = fit_schedule([on for on, _cents in rows])
 
         totals: dict[tuple[int, int], int] = defaultdict(int)
         for on, cents in rows:
-            totals[attributed_month(on, cadence)] += cents
+            totals[attributed_month(on, schedule)] += cents
         return totals
 
     async def monthly_report(self, user_id: uuid.UUID, months: int = 6) -> MonthlyReportResponse:
         today = date.today()
         start = _shift_months(today, months - 1)
         flows = await self.txns.monthly_flows(user_id, start, today)
-        # Income comes from the pay-period attribution, not the calendar-month
+        # Income comes from the payday attribution, not the calendar-month
         # column in ``flows``, so this chart agrees with the 50/30/20 report.
         income_by_month = await self._income_by_month(user_id, start, today)
 
@@ -108,9 +111,9 @@ class ReportsService:
         income_override_cents: int | None = None,
     ) -> BudgetRuleReport:
         start, end = month_bounds(month)
-        # Not sum_income over the calendar month: a bi-weekly earner whose
-        # cheque lands on the 1st would otherwise show three cheques here and
-        # get 50/30/20 targets inflated by half.
+        # Not sum_income over the calendar month: a bi-weekly earner whose next
+        # cheque was paid a day early, before the month turned over, would
+        # otherwise show three cheques here and get every target inflated by half.
         by_month = await self._income_by_month(user_id, start, end)
         detected_cents = by_month.get((start.year, start.month), 0)
         income_cents = (
