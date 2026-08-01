@@ -1,0 +1,14 @@
+# Local host-port overrides — avoids clashing with other stacks already using
+# 5432/8000 on this machine. Container-internal networking is unchanged.
+# `!override` replaces the base port list instead of merging with it.
+services:
+  postgres:
+    ports: !override
+      - "5433:5432"   # host 5432 taken by another Postgres
+  api:
+    ports: !override
+      - "8010:8000"   # host 8000 taken by another service
+    environment:
+      # Ollama runs on the Windows host, not the compose `ollama` profile
+      # service the base file assumes.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434

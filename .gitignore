@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.db
+
+# Env / secrets
+.env
+backend/.env
+mobile/.env
+
+# Node / Expo
+node_modules/
+mobile/.expo/
+mobile/dist/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ---- Machine-local agent/editor settings ----
+.claude/settings.local.json
+

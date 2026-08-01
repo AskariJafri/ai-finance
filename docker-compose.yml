@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: finance
+      POSTGRES_PASSWORD: finance
+      POSTGRES_DB: finance
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Container-network overrides (win over .env values).
+      DATABASE_URL: postgresql+asyncpg://finance:finance@postgres:5432/finance
+      OLLAMA_BASE_URL: http://ollama:11434
+    ports:
+      - "8000:8000"
+    # Apply migrations, then serve.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  # Local LLM. Optional: start with `docker compose --profile ai up`.
+  # Prefer running Ollama on the host instead? Set OLLAMA_BASE_URL accordingly.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ai"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+volumes:
+  pgdata:
+  ollama:

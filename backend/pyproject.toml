@@ -1,0 +1,63 @@
+[project]
+name = "ai-finance-backend"
+version = "0.1.0"
+description = "AI Personal Finance — FastAPI backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "email-validator>=2.1",
+    "pyjwt>=2.8",
+    "argon2-cffi>=23.1",
+    "cryptography>=42.0",
+    "plaid-python>=18.0",
+    "snaptrade-python-sdk>=11.0",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "aiosqlite>=0.20",
+    "ruff>=0.5",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# These modules are prose, not logic: user-facing explainer copy and LLM
+# prompts. Hard-wrapping natural language at 100 columns hurts readability and
+# makes diffs noisy, so the line-length rule is lifted here only.
+"app/content/*.py" = ["E501"]
+"app/ai/committee.py" = ["E501"]
+"app/ai/prompts.py" = ["E501"]
+
+# B008 flags function calls in argument defaults, but `Depends(...)` and
+# `Query(...)` in signature defaults are exactly how FastAPI declares dependency
+# injection and query params. The rule is a known false positive there.
+"app/api/**/*.py" = ["B008"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]

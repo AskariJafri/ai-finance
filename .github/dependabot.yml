@@ -1,0 +1,24 @@
+﻿version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "monthly" }
+    labels: ["type:chore"]
+
+  # The Python project lives in backend/ (pyproject.toml), not at the repo root.
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule: { interval: "monthly" }
+    open-pull-requests-limit: 5
+    labels: ["type:chore", "area:api"]
+
+  - package-ecosystem: "npm"
+    directory: "/mobile"
+    schedule: { interval: "monthly" }
+    open-pull-requests-limit: 5
+    labels: ["type:chore", "area:mobile"]
+
+  - package-ecosystem: "docker"
+    directory: "/backend"
+    schedule: { interval: "monthly" }
+    labels: ["type:chore"]

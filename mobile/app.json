@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "AI Finance",
+    "slug": "ai-finance",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "aifinance",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.aifinance.app"
+    },
+    "android": {
+      "package": "com.aifinance.app",
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": [
+      "expo-dev-client",
+      "expo-secure-store",
+      "expo-asset",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "apiBaseUrl": "http://192.168.40.28:8010/api/v1",
+      "eas": {
+        "projectId": "58b888ee-067c-4d47-8bf6-65d288813fe4"
+      }
+    },
+    "owner": "askarijafri"
+  }
+}

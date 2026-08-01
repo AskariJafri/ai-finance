@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — lint & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff)
+        run: ruff format --check .
+
+      # The suite runs against in-memory SQLite via aiosqlite and never touches
+      # Postgres or the network (see tests/conftest.py), so no service
+      # containers are needed. The Plaid gateway resolves to MockPlaidClient
+      # because no credentials are configured.
+      - name: Test (pytest)
+        run: pytest -q
+
+  migrations:
+    name: Alembic migrations apply cleanly
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_finance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run migrations to head
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/ai_finance
+        run: alembic upgrade head
