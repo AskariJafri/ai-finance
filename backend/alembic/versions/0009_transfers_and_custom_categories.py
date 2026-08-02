@@ -22,6 +22,12 @@ from __future__ import annotations
 import sqlalchemy as sa
 
 from alembic import op
+from app.db.migration_utils import (
+    add_column_if_missing,
+    create_index_if_missing,
+    drop_column_if_present,
+    drop_index_if_present,
+)
 
 revision = "0009_transfers_categories"
 down_revision = "0008_chat"
@@ -30,16 +36,24 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Guarded because a fresh database is created from current ORM metadata by
+    # 0001's create_all and therefore already has these columns. See
+    # app/db/migration_utils.py.
+    #
     # server_default stays in place after the backfill (rather than being
     # dropped) so any raw INSERT path that predates the ORM column is still safe.
-    op.add_column(
+    add_column_if_missing(
         "transactions",
         sa.Column("is_transfer", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
-    op.add_column("transactions", sa.Column("transfer_group_id", sa.Uuid(), nullable=True))
-    op.create_index("ix_transactions_is_transfer", "transactions", ["is_transfer"])
-    op.create_index("ix_transactions_transfer_group_id", "transactions", ["transfer_group_id"])
-    op.add_column("categories", sa.Column("budget_bucket", sa.String(length=10), nullable=True))
+    add_column_if_missing("transactions", sa.Column("transfer_group_id", sa.Uuid(), nullable=True))
+    create_index_if_missing("ix_transactions_is_transfer", "transactions", ["is_transfer"])
+    create_index_if_missing(
+        "ix_transactions_transfer_group_id", "transactions", ["transfer_group_id"]
+    )
+    add_column_if_missing(
+        "categories", sa.Column("budget_bucket", sa.String(length=10), nullable=True)
+    )
 
     # Backfill 1: anything already sitting in a TRANSFER-group category was
     # already being excluded from spending by the old category-group guard, so
@@ -75,8 +89,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("categories", "budget_bucket")
-    op.drop_index("ix_transactions_transfer_group_id", table_name="transactions")
-    op.drop_index("ix_transactions_is_transfer", table_name="transactions")
-    op.drop_column("transactions", "transfer_group_id")
-    op.drop_column("transactions", "is_transfer")
+    drop_column_if_present("categories", "budget_bucket")
+    drop_index_if_present("ix_transactions_transfer_group_id", "transactions")
+    drop_index_if_present("ix_transactions_is_transfer", "transactions")
+    drop_column_if_present("transactions", "transfer_group_id")
+    drop_column_if_present("transactions", "is_transfer")
