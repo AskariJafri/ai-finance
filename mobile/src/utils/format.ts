@@ -20,9 +20,24 @@ export function formatPercent(fraction: number): string {
   return `${Math.round(fraction * 100)}%`;
 }
 
+/**
+ * "2026-07-02" -> "Jul 2", in the reader's own timezone.
+ *
+ * The parts are split out by hand rather than handed to `new Date(iso)`,
+ * because a date-only string is spec'd to parse as *UTC* midnight while
+ * `toLocaleDateString` renders in local time. Anywhere west of UTC that
+ * subtracts a day: a payday of 2026-07-02 displayed as "Jul 1" in Toronto.
+ * A transaction has no time of day to begin with, so local midnight is the
+ * honest reading of it.
+ */
 export function formatDate(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleDateString("en-CA", { month: "short", day: "numeric" });
+  const year = Number(iso.slice(0, 4));
+  const mon = Number(iso.slice(5, 7));
+  const day = Number(iso.slice(8, 10));
+  return new Date(year, mon - 1, day).toLocaleDateString("en-CA", {
+    month: "short",
+    day: "numeric",
+  });
 }
 
 /** "2026-07" -> "July 2026". */

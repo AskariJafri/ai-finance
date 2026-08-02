@@ -41,8 +41,16 @@ CUSTOM_CATEGORY_PALETTE: tuple[str, ...] = (
 )
 
 
+# The one income category that represents *pay from an employer*, as opposed to
+# every other way money can arrive. Budget targets key off this: a tax refund or
+# an e-transfer from a friend is real money, but it is not something to size a
+# monthly budget against. Anything else — including uncategorized inflows —
+# counts as other income, which fails safe: an unrecognised deposit can't
+# silently inflate a 50/30/20 target.
+SALARY_SLUG = "salary"
+
 SEED_CATEGORIES: tuple[SeedCategory, ...] = (
-    SeedCategory("salary", "Salary", CategoryGroup.INCOME, "cash", "#16A34A"),
+    SeedCategory(SALARY_SLUG, "Salary", CategoryGroup.INCOME, "cash", "#16A34A"),
     SeedCategory("income-other", "Other Income", CategoryGroup.INCOME, "plus", "#22C55E"),
     SeedCategory("groceries", "Groceries", CategoryGroup.EXPENSE, "cart", "#F59E0B", "needs"),
     SeedCategory("restaurants", "Restaurants", CategoryGroup.EXPENSE, "food", "#EF4444", "wants"),

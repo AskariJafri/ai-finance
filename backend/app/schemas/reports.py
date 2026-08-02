@@ -9,10 +9,11 @@ from app.schemas.dashboard import CategorySpend
 
 class MonthReport(BaseModel):
     month: str  # "YYYY-MM"
-    income: float
+    income: float  # salary only, attributed to the payday's month
+    other_income: float  # refunds, benefits, gifts, one-off deposits
     spending: float
-    net: float
-    savings_rate: float  # 0..1, 0 when no income
+    net: float  # income + other_income - spending
+    savings_rate: float  # 0..1 of all money in, 0 when nothing came in
     by_category: list[CategorySpend]
 
 
@@ -36,8 +37,12 @@ class BucketStat(BaseModel):
 
 class BudgetRuleReport(BaseModel):
     month: str
+    # Salary. The 50/30/20 targets are all percentages of this, which is why
+    # other_income is reported beside it rather than folded into it: a one-off
+    # deposit should not raise the bar for what you're allowed to spend.
     income: float
     detected_income: float
+    other_income: float
     income_source: Literal["detected", "override"]
     needs: BucketStat
     wants: BucketStat

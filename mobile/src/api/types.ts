@@ -110,9 +110,10 @@ export type PlaidCredentialInput = {
 // --- Reports / 50-30-20 / Advice ---
 export type MonthReport = {
   month: string; // "YYYY-MM"
-  income: number;
+  income: number; // salary only, counted in the month of the payday it was paid against
+  other_income: number; // refunds, benefits, gifts, one-off deposits
   spending: number;
-  net: number;
+  net: number; // income + other_income - spending
   savings_rate: number;
   by_category: CategorySpend[];
 };
@@ -132,8 +133,12 @@ export type BucketStat = {
 
 export type BudgetRuleReport = {
   month: string;
+  // Salary. Every target below is a percentage of this, which is why
+  // other_income sits beside it rather than inside it — a one-off deposit
+  // shouldn't raise the bar for what you're allowed to spend.
   income: number;
   detected_income: number;
+  other_income: number;
   income_source: "detected" | "override";
   needs: BucketStat;
   wants: BucketStat;

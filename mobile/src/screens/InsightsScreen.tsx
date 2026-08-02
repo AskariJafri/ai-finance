@@ -92,10 +92,18 @@ export function InsightsScreen() {
               </Text>
               <View style={styles.statsRow}>
                 <Stat
-                  label="Income"
+                  label="Salary"
                   value={formatCurrency(current.income)}
                   color={theme.colors.positive}
                 />
+                {/* Only worth a column in the months something else arrived. */}
+                {current.other_income > 0 ? (
+                  <Stat
+                    label="Other income"
+                    value={formatCurrency(current.other_income)}
+                    color={theme.colors.positive}
+                  />
+                ) : null}
                 <Stat
                   label="Spending"
                   value={formatCurrency(current.spending)}
@@ -149,8 +157,11 @@ export function InsightsScreen() {
             {rule.data ? (
               <>
                 <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginBottom: 12 }}>
-                  {formatCurrency(rule.data.income)} income — 50% needs, 30% wants,
+                  {formatCurrency(rule.data.income)} salary — 50% needs, 30% wants,
                   20% savings
+                  {rule.data.other_income > 0
+                    ? ` · ${formatCurrency(rule.data.other_income)} other income not budgeted`
+                    : ""}
                 </Text>
                 <BudgetRuleBars report={rule.data} />
               </>

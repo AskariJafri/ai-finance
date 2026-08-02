@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import Account, Category, Transaction
 from app.domain.accounts import LIABILITY_ACCOUNT_TYPES
+from app.domain.categories import SALARY_SLUG
 from app.domain.enums import CategoryGroup, CategorySource
 from app.domain.transfer_matching import Leg
 
@@ -152,35 +153,63 @@ class TransactionRepository:
         """
         stmt = self._flows_select(
             (func.coalesce(func.sum(-Transaction.amount_cents), 0),), user_id, start, end
-        ).where(
+        ).where(*self._income_where())
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    def _income_where(self):
+        """Predicates every income aggregate shares, on top of ``_flows_where``.
+
+        Split out so :meth:`sum_income`, :meth:`salary_rows` and
+        :meth:`sum_other_income` cannot drift apart the way the spending and
+        income queries once did — the three must partition the same set of rows
+        exactly, or money appears or vanishes between the reports.
+        """
+        return (
             Transaction.amount_cents < 0,
             func.coalesce(Account.type, "").notin_(LIABILITY_ACCOUNT_TYPES),
         )
-        return int((await self.session.execute(stmt)).scalar_one())
 
-    async def income_rows(
+    async def salary_rows(
         self, user_id: uuid.UUID, start: date_type, end: date_type
     ) -> list[tuple[date_type, int]]:
-        """``[(date, cents)]``, one row per pay date, for real income inflows.
+        """``[(date, cents)]``, one row per pay date, for **salary only**.
 
-        Same guards as :meth:`sum_income` — this is that query without the
-        final SUM, so the caller can attribute each deposit to a pay period
-        (see :mod:`app.domain.income_periods`) instead of to whatever calendar
-        month it happened to land in.
+        Same guards as :meth:`sum_income`, narrowed to the salary category, and
+        without the final SUM so the caller can attribute each cheque to the
+        payday it was paid against (see :mod:`app.domain.income_periods`).
+
+        Salary-only matters twice over. It keeps a tax refund or a transfer
+        from a friend out of the figure that sizes the 50/30/20 targets, and it
+        keeps those same one-off deposits out of the pay-cadence fit — a run of
+        EI payments landing every two weeks alongside real payroll would
+        otherwise look like part of the same schedule.
         """
         stmt = (
             self._flows_select(
                 (Transaction.date, func.sum(-Transaction.amount_cents)), user_id, start, end
             )
-            .where(
-                Transaction.amount_cents < 0,
-                func.coalesce(Account.type, "").notin_(LIABILITY_ACCOUNT_TYPES),
-            )
+            .where(*self._income_where(), Category.slug == SALARY_SLUG)
             .group_by(Transaction.date)
             .order_by(Transaction.date)
         )
         rows = (await self.session.execute(stmt)).all()
         return [(on, int(total)) for on, total in rows]
+
+    async def sum_other_income(self, user_id: uuid.UUID, start: date_type, end: date_type) -> int:
+        """Every non-salary inflow: refunds, benefits, gifts, one-off deposits.
+
+        Uncategorized inflows land here rather than in salary. That is the safe
+        direction — an unrecognised deposit that got treated as pay would
+        inflate all three budget targets, whereas one treated as other income is
+        merely reported next to them.
+        """
+        stmt = self._flows_select(
+            (func.coalesce(func.sum(-Transaction.amount_cents), 0),), user_id, start, end
+        ).where(
+            *self._income_where(),
+            func.coalesce(Category.slug, "") != SALARY_SLUG,
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
 
     async def spend_by_category(
         self, user_id: uuid.UUID, start: date_type, end: date_type

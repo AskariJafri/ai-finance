@@ -145,6 +145,13 @@ async def test_delete_reassigns_to_uncategorized_and_sets_source(client: AsyncCl
 
     txns = (await client.get(f"{PREFIX}/transactions", headers=headers)).json()
     target = txns[0]
+    # Whether this transaction starts out uncategorized depends on how much of
+    # the categorizer ran: rules always apply, but the LLM leg is skipped when
+    # no provider is reachable (as in CI). Moving an *already* uncategorized
+    # transaction into Temp Category drops the count by one first, so the net
+    # change after deleting the category is zero rather than plus one. Capture
+    # the starting state instead of assuming it.
+    target_was_uncategorized = target["category"]["slug"] == "uncategorized"
     patched = await client.patch(
         f"{PREFIX}/transactions/{target['id']}/category",
         headers=headers,
@@ -161,7 +168,8 @@ async def test_delete_reassigns_to_uncategorized_and_sets_source(client: AsyncCl
     assert moved["category_source"] == CategorySource.UNCATEGORIZED.value
 
     after = (await client.get(f"{PREFIX}/dashboard/summary", headers=headers)).json()
-    assert after["uncategorized_count"] == before_uncategorized + 1
+    expected = before_uncategorized + (0 if target_was_uncategorized else 1)
+    assert after["uncategorized_count"] == expected
 
 
 @pytest.mark.asyncio

@@ -48,10 +48,10 @@ class ReportsService:
     def __init__(self, session: AsyncSession) -> None:
         self.txns = TransactionRepository(session)
 
-    async def _income_by_month(
+    async def _salary_by_month(
         self, user_id: uuid.UUID, start: date, end: date
     ) -> dict[tuple[int, int], int]:
-        """Income cents keyed by the ``(year, month)`` it's attributed to.
+        """Salary cents keyed by the ``(year, month)`` it's attributed to.
 
         Bi-weekly pay doesn't divide evenly into calendar months, and a deposit
         gets moved off its payday whenever that payday falls on a weekend or a
@@ -61,8 +61,12 @@ class ReportsService:
         Looks back far enough to fit the schedule, and pads both ends of the
         range by ``MAX_SHIFT_DAYS`` so a deposit that cleared just outside the
         requested months can still be attributed into them.
+
+        Salary only — everything else that arrives is real money but is not
+        something to size a monthly budget against, and is reported separately
+        as other income.
         """
-        rows = await self.txns.income_rows(
+        rows = await self.txns.salary_rows(
             user_id,
             start - timedelta(days=CADENCE_HISTORY_DAYS),
             end + timedelta(days=MAX_SHIFT_DAYS),
@@ -80,7 +84,7 @@ class ReportsService:
         flows = await self.txns.monthly_flows(user_id, start, today)
         # Income comes from the payday attribution, not the calendar-month
         # column in ``flows``, so this chart agrees with the 50/30/20 report.
-        income_by_month = await self._income_by_month(user_id, start, today)
+        income_by_month = await self._salary_by_month(user_id, start, today)
 
         out: list[MonthReport] = []
         for year, mon, spending_cents, _calendar_income_cents in flows:
@@ -88,14 +92,22 @@ class ReportsService:
             month = f"{year:04d}-{mon:02d}"
             m_start, m_end = month_bounds(month)
             by_category = await self.txns.spend_by_category(user_id, m_start, m_end)
-            net_cents = income_cents - spending_cents
+            other_cents = await self.txns.sum_other_income(user_id, m_start, m_end)
+            # Net and savings rate are cash questions — what actually landed
+            # against what actually went out — so other income belongs in them
+            # even though it is deliberately kept out of the budget targets.
+            net_cents = income_cents + other_cents - spending_cents
+            total_in_cents = income_cents + other_cents
             out.append(
                 MonthReport(
                     month=month,
                     income=cents_to_dollars(income_cents),
+                    other_income=cents_to_dollars(other_cents),
                     spending=cents_to_dollars(spending_cents),
                     net=cents_to_dollars(net_cents),
-                    savings_rate=(round(net_cents / income_cents, 4) if income_cents > 0 else 0.0),
+                    savings_rate=(
+                        round(net_cents / total_in_cents, 4) if total_in_cents > 0 else 0.0
+                    ),
                     by_category=[
                         CategorySpend(category=name, color=color, amount=cents_to_dollars(total))
                         for name, color, total in by_category
@@ -111,14 +123,17 @@ class ReportsService:
         income_override_cents: int | None = None,
     ) -> BudgetRuleReport:
         start, end = month_bounds(month)
-        # Not sum_income over the calendar month: a bi-weekly earner whose next
-        # cheque was paid a day early, before the month turned over, would
-        # otherwise show three cheques here and get every target inflated by half.
-        by_month = await self._income_by_month(user_id, start, end)
+        # Not sum_income over the calendar month, on two counts: that would
+        # count a tax refund or an e-transfer from a friend as pay, and a
+        # bi-weekly earner whose next cheque was paid a day early — before the
+        # month turned over — would show three cheques here and get every
+        # target inflated by half.
+        by_month = await self._salary_by_month(user_id, start, end)
         detected_cents = by_month.get((start.year, start.month), 0)
         income_cents = (
             income_override_cents if income_override_cents is not None else detected_cents
         )
+        other_income_cents = await self.txns.sum_other_income(user_id, start, end)
 
         needs_cents = 0
         wants_cents = 0
@@ -147,6 +162,7 @@ class ReportsService:
             month=month,
             income=cents_to_dollars(income_cents),
             detected_income=cents_to_dollars(detected_cents),
+            other_income=cents_to_dollars(other_income_cents),
             income_source=("override" if income_override_cents is not None else "detected"),
             needs=stat(needs_cents, 0.5),
             wants=stat(wants_cents, 0.3),
