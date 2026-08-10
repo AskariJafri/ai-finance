@@ -224,8 +224,8 @@ export function useGenerateAdvice() {
       (
         await api.post<Advice>("/advice/monthly", null, {
           params: { month: vars.month, force: vars.force ?? false },
-          // Local LLM generation is slow; outlive the client's default timeout.
-          timeout: 120_000,
+          // Generation still outlives the client's 20s default.
+          timeout: 60_000,
         })
       ).data,
     onSuccess: (data) => qc.setQueryData(["advice", data.month], data),
@@ -261,7 +261,7 @@ export function useAnalyzeStock() {
         await api.post<CommitteeResult>(
           "/invest/committee/analyze",
           { symbol },
-          { timeout: 240_000 },
+          { timeout: 60_000 },
         )
       ).data,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["invest", "committee"] }),
@@ -512,14 +512,14 @@ export function useProposeRebalance() {
 
 // --- deploy cash ---
 /**
- * Slow by design: the AI committee deliberates on each shortlisted ticker
- * against a local model, so this blows straight through the client's 20s
- * default. Give it five minutes.
+ * The AI committee deliberates on each shortlisted ticker — one request per
+ * ticker, run concurrently — so this outruns the client's 20s default. The
+ * ceiling is the server's own gateway timeout, not the model.
  */
 export function useDeployPlan() {
   return useMutation({
     mutationFn: async (body: DeployPlanRequest) =>
-      (await api.post<DeployPlan>("/invest/deploy/propose", body, { timeout: 300_000 }))
+      (await api.post<DeployPlan>("/invest/deploy/propose", body, { timeout: 60_000 }))
         .data,
   });
 }
@@ -670,7 +670,7 @@ export function useGenerateInvestInsight() {
       (
         await api.post<Advice>("/invest/insight/generate", null, {
           params: { force: vars.force ?? false },
-          timeout: 120_000,
+          timeout: 60_000,
         })
       ).data,
     onSuccess: (data) => qc.setQueryData(["invest", "insight"], data),
@@ -773,8 +773,8 @@ export function useSendChatMessage() {
             session_id: vars.session_id ?? null,
             include_finances: vars.include_finances ?? true,
           },
-          // A local model can take a while to answer; outlive the default 20s.
-          { timeout: 180_000 },
+          // A reply is a full generation; outlive the default 20s.
+          { timeout: 60_000 },
         )
       ).data,
     onSuccess: (data) => {

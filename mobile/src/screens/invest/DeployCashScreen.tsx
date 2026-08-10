@@ -106,7 +106,7 @@ export function DeployCashScreen() {
           />
           <Text style={[styles.hint, { color: theme.colors.textMuted }]}>
             A rules pass ranks every candidate, then the AI committee argues over the
-            shortlist. That second step runs on a local model — expect 2–4 minutes.
+            shortlist — one deliberation per finalist. Give it a few seconds.
           </Text>
           {plan.error ? (
             <Text style={{ color: theme.colors.danger, fontSize: 12, marginTop: 8 }}>

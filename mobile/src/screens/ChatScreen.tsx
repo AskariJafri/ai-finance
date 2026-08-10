@@ -258,7 +258,7 @@ function Thinking() {
     <View style={styles.thinking}>
       <ActivityIndicator color={theme.colors.primary} />
       <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
-        Thinking — a local model can take a minute…
+        Thinking…
       </Text>
     </View>
   );
