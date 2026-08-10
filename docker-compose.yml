@@ -23,9 +23,8 @@ services:
     env_file:
       - .env
     environment:
-      # Container-network overrides (win over .env values).
+      # Container-network override (wins over .env values).
       DATABASE_URL: postgresql+asyncpg://finance:finance@postgres:5432/finance
-      OLLAMA_BASE_URL: http://ollama:11434
     ports:
       - "8000:8000"
     # Apply migrations, then serve.
@@ -33,16 +32,5 @@ services:
       sh -c "alembic upgrade head &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
-  # Local LLM. Optional: start with `docker compose --profile ai up`.
-  # Prefer running Ollama on the host instead? Set OLLAMA_BASE_URL accordingly.
-  ollama:
-    image: ollama/ollama:latest
-    profiles: ["ai"]
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama:/root/.ollama
-
 volumes:
   pgdata:
-  ollama:

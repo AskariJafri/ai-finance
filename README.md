@@ -57,12 +57,25 @@ With no Plaid credentials set, the backend uses a built-in **mock bank** that
 seeds realistic accounts/transactions — so you can exercise the whole flow with
 zero external setup.
 
-### Enable local AI (Ollama)
+### Enable AI
+
+Inference is hosted, not local. Get a free key at
+[openrouter.ai/keys](https://openrouter.ai/keys) (no credit card) and set it:
+
 ```bash
-docker compose --profile ai up -d ollama
-docker compose exec ollama ollama pull llama3.1
+LLM_API_KEY=sk-or-...            # in .env
 ```
-Or run Ollama on your host and point `OLLAMA_BASE_URL` at it.
+
+Leave it blank and the app still runs — every AI feature falls back to its
+rules-based answer rather than failing.
+
+`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` are the whole configuration, and
+the client is plain OpenAI-compatible HTTP, so Groq, Cerebras or the Hugging
+Face router work by changing those three values.
+
+**Free-model quota:** 20 requests/minute and 50/day (1,000/day once you've
+bought $10 of credits at any point). Costs are one request per chat message, per
+advice generation, and per committee ticker.
 
 ## Backend — local dev
 
@@ -157,8 +170,8 @@ RRSP, market vs limit orders). Matched entries go into the prompt as the
 authoritative wording so the model paraphrases reviewed copy instead of
 inventing a definition.
 
-Because the LLM is a local Ollama model that may simply not be running, replies
-degrade in three steps and a turn never 500s:
+Because the model may be unconfigured, rate limited or simply having a bad day,
+replies degrade in three steps and a turn never 500s:
 
 | `source` | Meaning |
 |----------|---------|
@@ -176,6 +189,15 @@ your balances entering the prompt. The assistant never places trades.
 See [`mobile/README.md`](mobile/README.md) for the Expo dev-build setup, env
 configuration (API base URL), and screens (Auth, Link Bank, Dashboard,
 Transactions, Invest, Ask).
+
+## Deploying
+
+The backend is stateless — no filesystem writes, no background workers, no
+broker — so it deploys as a single container against a managed Postgres. See
+[`backend/README.md`](backend/README.md) for the Hugging Face Spaces + Neon
+walkthrough, both on free tiers. The container migrates the database on start,
+and refuses to boot in production while the placeholder `JWT_SECRET` or
+`ENCRYPTION_KEY` are still in place.
 
 ## Testing
 
@@ -213,7 +235,7 @@ cd backend && pytest        # unit (crypto, JWT, categorization) + integration (
 | POST | `/chat/sessions` | start an empty thread |
 | DELETE | `/chat/sessions/{id}` | delete a thread and its messages |
 | GET  | `/chat/sessions/{id}/messages` | full transcript of one thread |
-| POST | `/chat/messages` | ask a question (slow — local model generates the reply) |
+| POST | `/chat/messages` | ask a question (one LLM request per message) |
 
 ## Bring your own Plaid keys
 
