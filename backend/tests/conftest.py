@@ -1,25 +1,38 @@
 """Test fixtures: in-memory SQLite DB + ASGI client with overridden session.
 
 Tests never touch Postgres or the network. The Plaid gateway auto-resolves to
-``MockPlaidClient`` because no credentials are configured, and Ollama is simply
-unavailable (categorizer degrades gracefully) unless a test injects a fake LLM.
+``MockPlaidClient`` because no credentials are configured, and the LLM is simply
+unconfigured (categorizer degrades gracefully) unless a test injects a fake.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import settings
 from app.db.base import Base
 from app.db.session import get_session
 from app.main import create_app
 from app.repositories.rules import CategoryRuleRepository
 
 TEST_URL = "sqlite+aiosqlite:///:memory:"
+
+
+@pytest.fixture(autouse=True)
+def _llm_configured(monkeypatch):
+    """Make ``settings.ai_available`` track ``ai_enabled`` alone.
+
+    The AI paths are gated on a key being present, so without this every test
+    that injects a fake LLM would silently take the fallback branch instead.
+    Nothing reaches the network — the key is never used by a fake.
+    """
+    monkeypatch.setattr(settings, "llm_api_key", "test-key")
 
 
 @pytest_asyncio.fixture

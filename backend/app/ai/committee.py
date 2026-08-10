@@ -5,12 +5,19 @@ verdict: BUY / SKIP / HOLD.
 Design rules mirrored from the rest of the app:
 - The LLM never invents figures — every number in the prompts comes from
   `Indicators` / the quote. Agents only *interpret*.
-- Provider-agnostic: takes an `LLMProvider`, so it runs on local Ollama (free)
-  or any future backend, no code change.
-- Never fails the request: bad JSON from a small local model is salvaged, and
-  if the LLM is unavailable the CIO verdict falls back to a transparent
+- Provider-agnostic: takes an `LLMProvider`, so the hosted model behind it is an
+  env change, never a code change.
+- Never fails the request: imperfect JSON is salvaged, a short roster is padded,
+  and if the LLM is unavailable the verdict falls back to a transparent
   rules-based read of the indicators.
 - Educational only — not investment advice. Paper/sandbox context.
+
+**One call per ticker.** The five agents and the CIO used to be six separate
+requests. Free hosted tiers meter requests per day, and Deploy-Cash runs the
+committee over a whole shortlist, so the entire deliberation is now a single
+request returning every take plus the verdict. A capable hosted model holds all
+six roles in one pass; the six-call version existed because a 3B local model
+could not.
 """
 
 from __future__ import annotations
@@ -86,79 +93,141 @@ def _context(symbol: str, quote: dict, ind: Indicators) -> str:
     )
 
 
-_JSON_RULE = (
-    "Respond with ONLY a JSON object, no prose, no markdown: "
-    '{"stance": "<bullish|bearish|neutral|caution>", '
+#: role key -> (display name, the seat's mandate). Order is the order the UI
+#: renders takes in, and the order the model is asked to produce them.
+ROLES: tuple[tuple[str, str, str], ...] = (
+    (
+        "research",
+        "Research Analyst",
+        "judges whether price trend and momentum justify owning this now; precise and skeptical",
+    ),
+    (
+        "technical",
+        "Technical Analyst",
+        "reads momentum, trend and overbought/oversold from RSI and moving averages",
+    ),
+    (
+        "risk",
+        "Risk Officer",
+        "protects capital above all else; weighs volatility and drawdown",
+    ),
+    (
+        "bear",
+        "Devil's Advocate",
+        "attacks the bull case and names the failure scenarios",
+    ),
+    (
+        "pm",
+        "Portfolio Manager",
+        "sizes the position; balances conviction against risk, small size when uncertain",
+    ),
+)
+
+_STANCES = {"bullish", "bearish", "neutral", "caution"}
+
+COMMITTEE_SYSTEM = (
+    "You chair an investment committee and speak for every seat at the table. "
+    "The seats are:\n"
+    + "\n".join(f"- {key} ({name}): {mandate}" for key, name, mandate in ROLES)
+    + "\nEach seat reaches its own honest conclusion from the SAME data — they must not "
+    "converge out of politeness, and the Devil's Advocate must genuinely dissent when there "
+    "is a case to make. Then, as Chief Investment Officer, weigh every seat and decide. "
+    "Capital preservation beats returns; when uncertain, SKIP.\n"
+    "Never invent, estimate or recompute a figure — interpret only the numbers given."
+)
+
+_COMMITTEE_JSON_RULE = (
+    "Respond with ONLY a JSON object, no prose, no markdown:\n"
+    '{"agents": ['
+    '{"agent": "<' + "|".join(key for key, _, _ in ROLES) + '>", '
+    '"stance": "<bullish|bearish|neutral|caution>", '
     '"confidence": <0..1>, "thesis": "<=40 words"}'
+    "], "
+    '"action": "<BUY|SKIP|HOLD>", "confidence": <0..1>, "rationale": "<=60 words"}\n'
+    f"Include all {len(ROLES)} agents, once each, in the order listed above."
 )
 
 
-async def _run_agent(llm: LLMProvider, key: str, name: str, system: str, prompt: str) -> AgentTake:
-    try:
-        raw = await llm.complete(prompt + "\n\n" + _JSON_RULE, system=system, temperature=0.3)
-        data = _parse_json(raw)
-    except Exception as exc:  # noqa: BLE001 — any LLM error degrades this agent only
-        logger.warning("Committee agent %s failed: %s", key, exc)
-        data = {}
+def _take(key: str, name: str, data: dict | None) -> AgentTake:
+    data = data or {}
     stance = str(data.get("stance", "neutral")).lower()
-    if stance not in {"bullish", "bearish", "neutral", "caution"}:
+    if stance not in _STANCES:
         stance = "neutral"
     thesis = str(data.get("thesis") or "No read available (model unavailable).").strip()
     return AgentTake(key, name, stance, round(_clip(data.get("confidence")), 2), thesis[:400])
 
 
+def _takes_from(payload: dict) -> list[AgentTake]:
+    """Map the model's agent list onto the fixed roster.
+
+    Keyed by role rather than by position, and padded when a seat is missing, so
+    a short or reordered reply still renders a full committee instead of failing
+    the request.
+    """
+    raw = payload.get("agents")
+    by_key: dict[str, dict] = {}
+    if isinstance(raw, list):
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("agent", "")).lower().strip()
+            if key not in {k for k, _, _ in ROLES} and i < len(ROLES):
+                key = ROLES[i][0]  # unlabelled but in order
+            if key:
+                by_key.setdefault(key, item)
+    return [_take(key, name, by_key.get(key)) for key, name, _ in ROLES]
+
+
 async def run_committee(symbol: str, quote: dict, ind: Indicators, llm: LLMProvider) -> dict:
     ctx = _context(symbol, quote, ind)
-
-    specs = [
-        (
-            "research",
-            "Research Analyst",
-            "You are a Senior Research Analyst. Judge whether the price trend and momentum justify owning this now. Be precise and skeptical.",
-            f"Assess {symbol} as an investment from this data:\n{ctx}",
-        ),
-        (
-            "technical",
-            "Technical Analyst",
-            "You are a Technical Analyst. Read momentum, trend and overbought/oversold from RSI and moving averages.",
-            f"Technical read for {symbol}:\n{ctx}\nIs momentum favorable or stretched?",
-        ),
-        (
-            "risk",
-            "Risk Officer",
-            "You are the Chief Risk Officer. Your only job is protecting capital. Weigh volatility and drawdown.",
-            f"Risk of buying {symbol} now:\n{ctx}\nHow much could this hurt?",
-        ),
-        (
-            "bear",
-            "Devil's Advocate",
-            "You are the Devil's Advocate. Attack the bull case and name the failure scenarios.",
-            f"Make the bear case against buying {symbol}:\n{ctx}",
-        ),
-        (
-            "pm",
-            "Portfolio Manager",
-            "You are the Portfolio Manager sizing positions. Balance conviction against risk; small size when uncertain.",
-            f"Would you allocate to {symbol}, and how boldly?\n{ctx}",
-        ),
-    ]
-
-    takes = await asyncio.gather(
-        *(_run_agent(llm, key, name, system, prompt) for key, name, system, prompt in specs)
+    prompt = (
+        f"Deliberate on {symbol} @ {quote.get('price')} {quote.get('currency', '')}.\n"
+        f"Data:\n{ctx}\n\n"
+        "Give each seat's stance and one-line thesis, then your final decision.\n\n"
+        f"{_COMMITTEE_JSON_RULE}"
     )
 
-    cio = await _cio(symbol, quote, ind, takes, llm)
+    try:
+        raw = await llm.complete(prompt, system=COMMITTEE_SYSTEM, temperature=0.3, json_object=True)
+        payload = _parse_json(raw)
+    except Exception as exc:  # noqa: BLE001 — any LLM error degrades to rules
+        logger.warning("Committee failed for %s, using rules: %s", symbol, exc)
+        payload = {}
+
+    if not payload:
+        # Nothing usable came back at all. Say so honestly rather than showing a
+        # table of five seats that never spoke.
+        return rules_only(symbol, quote, ind)
+
+    takes = _takes_from(payload)
+    verdict = _verdict_from(payload, ind, takes)
     return {
         "symbol": symbol,
         "price": quote.get("price"),
         "currency": quote.get("currency", "USD"),
-        "action": cio["action"],
-        "confidence": cio["confidence"],
-        "summary": cio["summary"],
-        "source": cio["source"],
+        "action": verdict["action"],
+        "confidence": verdict["confidence"],
+        "summary": verdict["summary"],
+        "source": verdict["source"],
         "agents": [t.__dict__ for t in takes],
         "indicators": ind.as_dict(),
     }
+
+
+def _verdict_from(payload: dict, ind: Indicators, takes: list[AgentTake]) -> dict:
+    """The CIO's decision, or a transparent rules read when it is unusable."""
+    action = str(payload.get("action", "")).upper()
+    rationale = str(payload.get("rationale") or "").strip()
+    if action in VALID_ACTIONS and rationale:
+        return {
+            "action": action,
+            "confidence": round(_clip(payload.get("confidence")), 2),
+            "summary": rationale[:500],
+            "source": "ai",
+        }
+    bullish = sum(1 for t in takes if t.stance == "bullish")
+    bearish = sum(1 for t in takes if t.stance in ("bearish", "caution"))
+    return _rules_verdict(ind, bullish, bearish)
 
 
 async def run_committee_many(
@@ -170,8 +239,9 @@ async def run_committee_many(
     """Deliberate over several tickers concurrently.
 
     Each ticker degrades on its own: a committee that errors falls back to
-    ``rules_only`` for that symbol rather than losing the whole batch. Keep the
-    list short — every ticker costs six LLM calls.
+    ``rules_only`` for that symbol rather than losing the whole batch. One LLM
+    call per ticker, and the provider caps how many are in flight at once — keep
+    the list short anyway, since free tiers meter requests per day.
     """
 
     async def one(symbol: str, quote: dict, ind: Indicators) -> dict:
@@ -185,53 +255,13 @@ async def run_committee_many(
     return list(await asyncio.gather(*(one(s, q, i) for s, q, i in items)))
 
 
-async def _cio(symbol, quote, ind: Indicators, takes: list[AgentTake], llm: LLMProvider) -> dict:
-    bullish = sum(1 for t in takes if t.stance == "bullish")
-    bearish = sum(1 for t in takes if t.stance in ("bearish", "caution"))
-    board = "; ".join(f"{t.name}: {t.stance} — {t.thesis}" for t in takes)
-
-    system = (
-        "You are the Chief Investment Officer chairing the committee. Capital "
-        "preservation beats returns; when uncertain, SKIP. Weigh every member."
-    )
-    prompt = (
-        f"Final decision on {symbol} @ {quote.get('price')} {quote.get('currency', '')}.\n"
-        f"Committee: {board}\n"
-        f"Data: {_context(symbol, quote, ind)}\n\n"
-        'Respond with ONLY JSON: {"action":"<BUY|SKIP|HOLD>","confidence":<0..1>,'
-        '"rationale":"<=60 words"}'
-    )
-    try:
-        raw = await llm.complete(prompt, system=system, temperature=0.2)
-        data = _parse_json(raw)
-        action = str(data.get("action", "")).upper()
-        if action in VALID_ACTIONS and data.get("rationale"):
-            return {
-                "action": action,
-                "confidence": round(_clip(data.get("confidence")), 2),
-                "summary": str(data["rationale"]).strip()[:500],
-                "source": "ai",
-            }
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("CIO synthesis failed, using rules: %s", exc)
-
-    return _rules_verdict(ind, bullish, bearish)
-
-
 def rules_only(symbol: str, quote: dict, ind: Indicators) -> dict:
     """Full committee result without any LLM call — used when AI is disabled or
     unreachable, so the feature still works (transparently rules-based)."""
     stance = "bullish" if ind.trend == "up" else "bearish" if ind.trend == "down" else "neutral"
-    names = [
-        ("research", "Research Analyst"),
-        ("technical", "Technical Analyst"),
-        ("risk", "Risk Officer"),
-        ("bear", "Devil's Advocate"),
-        ("pm", "Portfolio Manager"),
-    ]
     takes = [
-        AgentTake(k, n, stance, 0.5, "AI offline — see the rules-based verdict below.")
-        for k, n in names
+        AgentTake(key, name, stance, 0.5, "AI offline — see the rules-based verdict below.")
+        for key, name, _ in ROLES
     ]
     verdict = _rules_verdict(ind, 1 if stance == "bullish" else 0, 1 if stance == "bearish" else 0)
     return {

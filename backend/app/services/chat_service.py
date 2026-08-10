@@ -4,8 +4,8 @@ Answers two kinds of question in one thread: "how am I doing?" (grounded in the
 user's own SQL-computed figures via ``FinanceContextBuilder``) and "what does
 this term mean?" (anchored to the reviewed copy in ``glossary``).
 
-Degradation is deliberate and layered, because the LLM here is a local Ollama
-model that may simply not be running:
+Degradation is deliberate and layered, because the hosted model may be
+unconfigured, rate limited or having a bad day:
 
     model answers  ->  reviewed explainer verbatim  ->  honest "AI is offline"
 
@@ -41,12 +41,13 @@ DISCLAIMER = (
 _OFFLINE = (
     "The AI assistant isn't reachable right now, so I can't answer that one. "
     "Your figures are still up to date on the Dashboard, Insights and Invest "
-    "tabs — those never depend on the AI. If you're running the local model, "
-    "check that Ollama is up and AI_ENABLED is on."
+    "tabs — those never depend on the AI. This usually clears up on its own; "
+    "if it doesn't, check that LLM_API_KEY is set and the daily request quota "
+    "hasn't run out."
 )
 
 # Sent with every reply's prompt; older turns are dropped rather than
-# summarized (summarizing would need a second slow local inference call).
+# summarized, which would cost a second request against the daily quota.
 _HISTORY_TURNS = 6
 
 
@@ -152,7 +153,7 @@ class ChatService:
         terms: list[str],
         history: list[tuple[str, str]],
     ) -> tuple[str, str, str | None]:
-        if settings.ai_enabled:
+        if settings.ai_available:
             try:
                 content = await self.llm.complete(
                     build_chat_prompt(

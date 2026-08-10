@@ -13,6 +13,7 @@ from datetime import date, timedelta
 import pytest
 from httpx import AsyncClient
 
+from app.ai.committee import ROLES
 from app.core.config import settings as app_settings
 from app.domain.enums import ProposedOrderStatus
 from app.integrations.marketdata.provider import BarPoint, MarketDataError, SymbolQuote
@@ -39,14 +40,28 @@ class FakeProvider:
 
 
 class BuyLLM:
-    """Every agent bullish, CIO returns BUY — exercises the sizing path."""
+    """Every seat bullish and the CIO returns BUY — exercises the sizing path.
+
+    One reply per ticker, since the whole committee is a single call.
+    """
 
     model = "fake"
 
-    async def complete(self, prompt: str, *, system=None, temperature: float = 0.0) -> str:
-        if '"action"' in prompt:  # the CIO's synthesis prompt
-            return '{"action":"BUY","confidence":0.8,"rationale":"Strong uptrend."}'
-        return '{"stance":"bullish","confidence":0.7,"thesis":"Momentum is favourable."}'
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(
+        self, prompt: str, *, system=None, temperature: float = 0.0, json_object: bool = False
+    ) -> str:
+        self.calls += 1
+        agents = ", ".join(
+            f'{{"agent":"{key}","stance":"bullish","confidence":0.7,'
+            f'"thesis":"Momentum is favourable."}}'
+            for key, _, _ in ROLES
+        )
+        return (
+            f'{{"agents":[{agents}],"action":"BUY","confidence":0.8,"rationale":"Strong uptrend."}}'
+        )
 
     async def is_available(self) -> bool:
         return True

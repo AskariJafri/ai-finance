@@ -21,7 +21,7 @@ class FakeLLM(LLMProvider):
         self.raise_error = raise_error
         self.calls = 0
 
-    async def complete(self, prompt, *, system=None, temperature=0.0) -> str:
+    async def complete(self, prompt, *, system=None, temperature=0.0, json_object=False) -> str:
         self.calls += 1
         if self.raise_error:
             raise RuntimeError("ollama down")

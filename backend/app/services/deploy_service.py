@@ -4,8 +4,8 @@ The one question the rest of the Invest module can't answer. `propose_rebalance`
 needs target weights already set; the committee analyses one ticker with no
 notion of a budget. This turns an amount into a concrete, executable buy list.
 
-Selection is two-stage, cheap before expensive, because the committee costs six
-LLM calls per ticker and runs against a local model:
+Selection is two-stage, cheap before expensive, because each committee ticker
+costs an LLM request and the free tier meters those per day:
 
   1. rank the whole candidate pool with `signal_for` — pure arithmetic over
      cached bars, no LLM, so it costs nothing to run over everything;
@@ -104,7 +104,7 @@ class DeployService:
                 body.amount, passed, len(pool), "rules", "No candidate could be priced."
             )
 
-        use_ai = body.use_ai and settings.ai_enabled and await self._llm_ready()
+        use_ai = body.use_ai and settings.ai_available and await self._llm_ready()
         results = await run_committee_many(
             [(sym, quote, ind) for sym, quote, ind, _ in quoted], self.llm, use_ai=use_ai
         )

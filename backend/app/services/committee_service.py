@@ -1,5 +1,5 @@
 """AI Committee service — gathers real market data for a ticker, runs the
-multi-agent committee (local Ollama, free), and persists each session.
+multi-agent committee in a single LLM call, and persists each session.
 
 The LLM only interprets numbers we computed; if it's disabled or unreachable
 the verdict degrades to a transparent rules-based read (never a fabricated one).
@@ -54,7 +54,7 @@ class CommitteeService:
                 "Not enough price history to analyze this ticker yet — try again shortly."
             ) from exc
 
-        if settings.ai_enabled and await self.llm.is_available():
+        if settings.ai_available and await self.llm.is_available():
             result = await run_committee(sym, quote_d, ind, self.llm)
         else:
             result = rules_only(sym, quote_d, ind)

@@ -23,9 +23,9 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 async def chat_status(user: CurrentUser, service: ChatServiceDep) -> ChatStatus:
     """Whether the assistant can answer, plus starter prompts for this user."""
     llm = get_chat_llm_provider()
-    available = await llm.is_available() if settings.ai_enabled else False
+    available = await llm.is_available() if settings.ai_available else False
     return ChatStatus(
-        ai_enabled=settings.ai_enabled,
+        ai_enabled=settings.ai_available,
         llm_available=available,
         model=getattr(llm, "model", None) if available else None,
         suggestions=await service.suggestions(user.id),
@@ -63,7 +63,7 @@ async def list_messages(
 async def send_message(
     body: ChatSendRequest, user: CurrentUser, service: ChatServiceDep
 ) -> ChatSendResponse:
-    """Ask a question. Slow — a local model generates the reply.
+    """Ask a question; a hosted model generates the reply.
 
     Never fails because inference failed: the reply degrades to the app's own
     reviewed explainers, and its ``source`` field says which path was taken.

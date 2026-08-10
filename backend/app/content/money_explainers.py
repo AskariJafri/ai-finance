@@ -4,7 +4,7 @@ Same no-hallucination role as ``invest_explainers`` — static, reviewed copy th
 LLM paraphrases rather than invents, and serves verbatim when it is offline —
 but scoped to the questions the chat assistant raises on its own: its starter
 prompts offer "Market vs limit orders", "TFSA vs RRSP" and "How do I start
-investing?", and the answers must not depend on a local model being up.
+investing?", and the answers must not depend on the model being reachable.
 
 Deliberately kept out of ``invest_explainers`` so ``GET /invest/explainers``
 (which the Invest screens key into for metric tooltips) stays a list of

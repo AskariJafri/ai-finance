@@ -57,7 +57,7 @@ class InvestInsightService:
 
         figures = await self.invest.health_figures(user_id)
 
-        if settings.ai_enabled:
+        if settings.ai_available:
             try:
                 content = await self.llm.complete(
                     build_invest_health_prompt(figures),

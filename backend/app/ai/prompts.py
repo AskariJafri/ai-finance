@@ -132,8 +132,8 @@ def build_chat_prompt(
     """Assemble the chat turn.
 
     ``history`` is (role, content) oldest-first and already truncated by the
-    caller — a local model's context window is small, so the data block and the
-    reviewed definitions get the room, not the back-scroll.
+    caller — the data block and the reviewed definitions earn the model's
+    attention more than the back-scroll does.
     """
     parts: list[str] = []
     if finance_context:

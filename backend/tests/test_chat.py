@@ -28,7 +28,7 @@ class RecordingLLM(FakeLLM):
         self.last_prompt: str | None = None
         self.last_system: str | None = None
 
-    async def complete(self, prompt, *, system=None, temperature=0.0) -> str:
+    async def complete(self, prompt, *, system=None, temperature=0.0, json_object=False) -> str:
         self.last_prompt = prompt
         self.last_system = system
         return await super().complete(prompt, system=system, temperature=temperature)

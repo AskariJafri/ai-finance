@@ -274,7 +274,7 @@ async def test_custom_slug_offered_to_ai_with_display_name(seeded_session):
     captured: dict[str, str] = {}
 
     class CapturingLLM(FakeLLM):
-        async def complete(self, prompt, *, system=None, temperature=0.0) -> str:
+        async def complete(self, prompt, *, system=None, temperature=0.0, json_object=False) -> str:
             captured["prompt"] = prompt
             return '{"category": "uncategorized", "confidence": 0.1}'
 

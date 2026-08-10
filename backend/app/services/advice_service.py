@@ -66,7 +66,7 @@ class AdviceService:
             user_id, month, income_override_cents=override
         )
 
-        if settings.ai_enabled:
+        if settings.ai_available:
             try:
                 content = await self.llm.complete(
                     build_advice_prompt(figures),

@@ -40,7 +40,9 @@ class AICategorizer:
             category_names=category_names,
         )
         try:
-            raw = await self.llm.complete(prompt, system=CATEGORIZE_SYSTEM, temperature=0.0)
+            raw = await self.llm.complete(
+                prompt, system=CATEGORIZE_SYSTEM, temperature=0.0, json_object=True
+            )
         except Exception as exc:  # LLMUnavailable or anything unexpected
             logger.warning("AI categorization unavailable: %s", exc)
             return None, 0.0

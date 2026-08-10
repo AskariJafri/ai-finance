@@ -7,6 +7,7 @@ default category taxonomy + rules.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -31,24 +32,47 @@ async def seed_reference_data() -> None:
     logger.info("Reference data seeded")
 
 
+async def seed_with_retry(attempts: int = 5, delay: float = 2.0) -> None:
+    """Seed, tolerating a database that is still waking up.
+
+    Free-tier Postgres suspends its compute when idle, so the first connection
+    after a deploy can time out. Retrying matters more than it looks: a single
+    swallowed failure boots the app with no categories seeded and only a warning
+    in the log, and categorization then misbehaves until the next restart
+    happens to catch the database awake.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            await seed_reference_data()
+            return
+        except Exception as exc:  # noqa: BLE001 - startup must not hard-fail
+            if attempt == attempts:
+                logger.error("Seeding failed after %d attempts: %s", attempts, exc)
+                return
+            logger.warning("Seeding attempt %d failed (%s); retrying", attempt, exc)
+            await asyncio.sleep(delay * attempt)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(logging.DEBUG if settings.debug else logging.INFO)
     logger.info("Starting %s (%s)", settings.app_name, settings.environment)
-    try:
-        await seed_reference_data()
-    except Exception as exc:  # pragma: no cover - startup resilience
-        logger.warning("Seeding skipped/failed (DB not ready?): %s", exc)
+    await seed_with_retry()
     yield
 
 
 def create_app() -> FastAPI:
+    # A deployed instance is on a public URL, and the schema names every
+    # endpoint including the brokerage ones. Auth still guards the data; this
+    # just declines to publish the map.
+    public = settings.environment != "production"
+
     app = FastAPI(
         title=settings.app_name,
         version="0.1.0",
         lifespan=lifespan,
-        docs_url="/docs",
-        openapi_url="/openapi.json",
+        docs_url="/docs" if public else None,
+        openapi_url="/openapi.json" if public else None,
     )
 
     app.add_middleware(

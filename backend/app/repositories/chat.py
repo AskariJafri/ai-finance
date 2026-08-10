@@ -87,7 +87,7 @@ class ChatRepository:
         """The last ``limit`` messages, oldest-first.
 
         Bounded because the whole thread is re-sent as prompt context on every
-        turn and a local model's context window is small.
+        turn, and an unbounded thread would grow every request without bound.
         """
         result = await self.session.execute(
             select(ChatMessage)

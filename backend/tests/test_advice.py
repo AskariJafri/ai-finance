@@ -7,8 +7,7 @@ from datetime import date
 
 import pytest
 
-from app.ai.llm.base import LLMProvider
-from app.ai.llm.ollama_provider import LLMUnavailable
+from app.ai.llm.base import LLMProvider, LLMUnavailable
 from app.db.models import Account, PlaidItem, Transaction
 from app.repositories.categories import CategoryRepository
 from app.repositories.users import UserRepository
@@ -23,7 +22,7 @@ class FakeLLM(LLMProvider):
         self.calls = 0
         self.model = "fake-model"
 
-    async def complete(self, prompt, *, system=None, temperature=0.0) -> str:
+    async def complete(self, prompt, *, system=None, temperature=0.0, json_object=False) -> str:
         self.calls += 1
         return self.response
 
@@ -35,9 +34,9 @@ class FailingLLM(LLMProvider):
     def __init__(self) -> None:
         self.calls = 0
 
-    async def complete(self, prompt, *, system=None, temperature=0.0) -> str:
+    async def complete(self, prompt, *, system=None, temperature=0.0, json_object=False) -> str:
         self.calls += 1
-        raise LLMUnavailable("ollama down")
+        raise LLMUnavailable("model unreachable")
 
     async def is_available(self) -> bool:
         return False
