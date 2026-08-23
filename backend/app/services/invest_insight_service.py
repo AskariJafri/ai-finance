@@ -113,6 +113,13 @@ class InvestInsightService:
                 f"{d['symbol']} is at {d['weight']:.0%} vs its {d['target']:.0%} "
                 "target — consider proposing a rebalance."
             )
+        usd = figures.get("usd_exposure_pct") or 0.0
+        if usd > 0.5:
+            tips.append(
+                f"{usd:.0%} of your invested value is in US-listed holdings, so "
+                "the CAD/USD rate moves your balance as much as some of your "
+                "positions do."
+            )
         if not figures.get("has_targets"):
             tips.append(
                 "Set target weights in the Rebalance screen to unlock drift "

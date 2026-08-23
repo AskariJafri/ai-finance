@@ -22,6 +22,20 @@ class AIInsightRepository:
         )
         return result.scalar_one_or_none()
 
+    async def delete(self, user_id: uuid.UUID, kind: str, period: str) -> bool:
+        """Drop a cached insight so the next read regenerates it.
+
+        Used when the figures underneath an insight change mid-period — a
+        brokerage sync, say — and serving the cached text would describe a
+        portfolio the user no longer has.
+        """
+        row = await self.get(user_id, kind, period)
+        if row is None:
+            return False
+        await self.session.delete(row)
+        await self.session.flush()
+        return True
+
     async def upsert(
         self,
         *,

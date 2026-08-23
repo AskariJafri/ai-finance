@@ -63,6 +63,7 @@ from app.schemas.invest import (
     ScenarioOut,
     ScenarioPositionImpact,
     SeriesPoint,
+    Sizing,
     SymbolLookupOut,
     SyncOut,
     TargetIn,
@@ -204,6 +205,9 @@ class InvestService:
                     "name": h.name,
                     "qty": h.qty,
                     "currency": h.currency,
+                    # Lets the app label a row as coming from the linked broker
+                    # rather than hand-entered; only /invest/holdings knew this.
+                    "is_synced": h.is_synced,
                     "price": close,
                     "avg_cost": cents_to_dollars(h.avg_cost_cents),
                     "market_value": market_value,
@@ -559,7 +563,9 @@ class InvestService:
         await self.session.commit()
         return await self.get_targets(user_id)
 
-    async def propose_rebalance(self, user_id: uuid.UUID, drift_threshold: float) -> ProposalOut:
+    async def propose_rebalance(
+        self, user_id: uuid.UUID, drift_threshold: float, sizing: Sizing = "shares"
+    ) -> ProposalOut:
         pf = await self.portfolio(user_id)
         if not pf.connected or not pf.positions:
             raise ValidationFailed("Add your holdings first.")
@@ -584,6 +590,10 @@ class InvestService:
         await self.proposals.expire_open_proposals(user_id)
         batch_id = uuid.uuid4()
         orders: list[ProposedOrder] = []
+        # Anything the chosen sizing cannot express. Reported in the note rather
+        # than dropped: a position missing from the plan with no explanation
+        # reads as "nothing to do here", which is the opposite of the truth.
+        skipped: list[str] = []
 
         for symbol in sorted(set(by_symbol) | set(targets)):
             current_value = by_symbol.get(symbol, {}).get("market_value", 0.0)
@@ -614,6 +624,21 @@ class InvestService:
             side = OrderSide.BUY if delta > 0 else OrderSide.SELL
             if side == OrderSide.SELL and position:
                 shares = min(shares, position["qty"])
+            if sizing == "shares":
+                whole = float(int(shares))
+                if side == OrderSide.SELL and position and whole < 1:
+                    # A fractional holding can only be sold whole or not at all,
+                    # and liquidating one is a normal order at any broker that
+                    # sold it to you. Rounding it to zero is how a 0.68-share
+                    # position disappeared from every plan.
+                    held_qty = position["qty"]
+                    if held_qty < 1 and shares >= held_qty - 1e-9:
+                        whole = held_qty
+                if whole < 1 and not (side == OrderSide.SELL and whole > 0):
+                    skipped.append(f"{symbol} (needs {shares:g} share(s) — less than one)")
+                    continue
+                shares = whole
+            dollars = round(shares * price_cad, 2)
 
             orders.append(
                 ProposedOrder(
@@ -623,14 +648,18 @@ class InvestService:
                     symbol=symbol,
                     side=side,
                     order_type="market",
-                    qty=shares,
-                    notional_cents=None,
-                    est_value_cents=round(shares * price_cad * 100),
+                    qty=None if sizing == "dollars" else shares,
+                    notional_cents=round(dollars * 100) if sizing == "dollars" else None,
+                    est_value_cents=round(dollars * 100),
                     reason=(
                         f"{symbol} is {abs(drift):.1%} "
                         f"{'above' if drift > 0 else 'below'} its {target_w:.0%} target "
-                        f"({'sell' if drift > 0 else 'buy'} about {shares:g} shares "
-                        f"≈ ${abs(delta):,.2f} CAD)."
+                        + (
+                            f"({'sell' if drift > 0 else 'buy'} about ${dollars:,.2f} CAD)."
+                            if sizing == "dollars"
+                            else f"({'sell' if drift > 0 else 'buy'} {shares:g} share(s) "
+                            f"≈ ${dollars:,.2f} CAD)."
+                        )
                     ),
                 )
             )
@@ -644,12 +673,29 @@ class InvestService:
         await self.proposals.add_all(orders)
         await self.session.commit()
 
-        note = (
-            "Place these trades at your own broker, then mark each one done — "
-            "your holdings update automatically. Sells first, then buys."
-            if orders
-            else f"Everything is within {drift_threshold:.0%} of target — no trades needed."
+        skipped_note = (
+            " Left out because whole shares can't express them: "
+            + ", ".join(skipped)
+            + ". Switch to dollar amounts to include them."
+            if skipped
+            else ""
         )
+        if not orders:
+            note = (
+                f"Everything is within {drift_threshold:.0%} of target — no trades needed."
+                + skipped_note
+            )
+        elif sizing == "dollars":
+            note = (
+                "Dollar amounts, so this needs a broker that sells fractional "
+                "shares. Place them at your own broker, then mark each one done "
+                "— your holdings update automatically. Sells first, then buys."
+            )
+        else:
+            note = (
+                "Place these trades at your own broker, then mark each one done — "
+                "your holdings update automatically. Sells first, then buys." + skipped_note
+            )
         return ProposalOut(
             batch_id=str(batch_id) if orders else None,
             orders=[order_out(o) for o in orders],
@@ -682,6 +728,11 @@ class InvestService:
         For a synced holding the broker is authoritative and the next position
         sync will overwrite this; applying it anyway keeps the portfolio correct
         in the window before that sync runs.
+
+        **Cash moves too.** A trade is an exchange, not a deletion: selling
+        converts shares into cash and buying does the reverse. Moving only the
+        shares makes every executed sell destroy its own proceeds and every buy
+        conjure its cost, so the account total drifts by the size of each trade.
         """
         filled_qty = order.qty if qty is None else qty
         filled_qty = filled_qty or 0.0
@@ -692,15 +743,21 @@ class InvestService:
                 raise ValidationFailed(
                     f"You don't hold {filled_qty:g} shares of {order.symbol} to sell."
                 )
+            proceeds = await self._fill_value_cad(order, holding.currency, filled_qty, fill_price)
             remaining = holding.qty - filled_qty
             if remaining <= 1e-9:
                 await self.holdings.delete(user_id, holding.id)
             else:
                 holding.qty = remaining
+            await self._move_cash(user_id, proceeds)
             return
 
         quote = await self.lookup_symbol(order.symbol)
         price = fill_price if fill_price is not None else quote.price
+        await self._move_cash(
+            user_id,
+            -await self._fill_value_cad(order, quote.currency, filled_qty, price),
+        )
         if holding is None:
             await self.holdings.upsert(
                 user_id=user_id,
@@ -716,6 +773,45 @@ class InvestService:
             new_qty = holding.qty + filled_qty
             holding.avg_cost_cents = round(((old_cost + price * filled_qty) / new_qty) * 100)
             holding.qty = new_qty
+
+    async def _fill_value_cad(
+        self,
+        order: ProposedOrder,
+        currency: str,
+        filled_qty: float,
+        fill_price: float | None,
+    ) -> float:
+        """What the trade was worth, in CAD.
+
+        A dollar-sized order already carries its value; a share-sized one is
+        quantity times the fill price, converted like everything else in the
+        portfolio.
+        """
+        if order.notional_cents and filled_qty == (order.qty or 0.0):
+            # Notional orders have no share count of their own, so their
+            # recorded amount is the value — already CAD, like every figure the
+            # planners produce.
+            return cents_to_dollars(order.notional_cents)
+        if fill_price is None:
+            quote = await self.lookup_symbol(order.symbol)
+            fill_price = quote.price
+            currency = quote.currency
+        value = filled_qty * fill_price
+        if currency.upper() == "USD":
+            value *= await self.market_data.latest_fx_rate() or 1.0
+        return value
+
+    async def _move_cash(self, user_id: uuid.UUID, delta_cad: float) -> None:
+        """Credit or debit the tracked cash balance. Never below zero.
+
+        A negative cash balance is not a state a cash account can be in — it
+        means the recorded figure was stale before the trade, not that the user
+        owes money. For a linked account the next sync replaces this with the
+        broker's own number anyway.
+        """
+        row = await self.user_settings.get_or_create(user_id)
+        row.invest_cash_cents = max(0, row.invest_cash_cents + round(delta_cad * 100))
+        await self.session.flush()
 
     async def mark_executed(
         self, user_id: uuid.UUID, order_id: uuid.UUID, fill_price: float | None
@@ -766,10 +862,38 @@ class InvestService:
         bucket = None
         if vol is not None:
             bucket = "conservative" if vol < 0.10 else "balanced" if vol <= 0.18 else "aggressive"
+
+        equity = portfolio.account.equity if portfolio.account else 0.0
+        cash = portfolio.account.cash if portfolio.account else 0.0
+        invested = portfolio.account.invested if portfolio.account else 0.0
+
+        # A CAD investor holding US-listed names carries currency risk on top of
+        # market risk, and it is invisible in the weights alone — every figure
+        # here is already converted to CAD.
+        usd_value = sum(
+            p["market_value"] for p in portfolio.positions if p.get("currency") == "USD"
+        )
+
+        positions = [
+            {
+                "symbol": p["symbol"],
+                "weight": p["weight"],
+                "market_value": p["market_value"],
+                "unrealized_pl_pct": p["unrealized_pl_pct"],
+                "currency": p["currency"],
+            }
+            for p in sorted(portfolio.positions, key=lambda p: p["market_value"], reverse=True)
+        ]
+
         return {
-            "equity": portfolio.account.equity if portfolio.account else None,
+            "equity": equity,
             "currency": "CAD",
             "n_positions": len(portfolio.positions),
+            "positions": positions,
+            "cash": round(cash, 2),
+            "cash_pct": round(cash / equity, 4) if equity else 0.0,
+            "usd_exposure_pct": round(usd_value / invested, 4) if invested else 0.0,
+            "from_brokerage": any(p.get("is_synced") for p in portfolio.positions),
             "risk": risk.portfolio.model_dump(),
             "risk_bucket": bucket,
             "concentration": risk.concentration.model_dump() if risk.concentration else None,
@@ -822,6 +946,7 @@ def order_out(o: ProposedOrder) -> ProposedOrderOut:
         symbol=o.symbol,
         side=o.side.value,
         qty=o.qty,
+        notional=cents_to_dollars(o.notional_cents) if o.notional_cents else None,
         est_value=cents_to_dollars(o.est_value_cents),
         reason=o.reason,
         status=o.status.value,

@@ -1,9 +1,18 @@
-"""Autonomous paper Auto-Trader — a disciplined, rules-based scanner.
+"""Auto-Trader — a disciplined, rules-based scanner over the real portfolio.
 
 HONEST: this does not beat the market. Its edge is discipline: pre-committed
-signals, capped sizing, a max-position guardrail, and it only ever sells
-positions it opened itself. SAFE BY DEFAULT — disabled + dry-run, so it does
-nothing until the user opts in. Operates only on the paper sandbox.
+signals, capped sizing and a max-position guardrail, applied the same way every
+run whether or not the numbers look exciting.
+
+**It suggests; it never trades.** A run reads the real holdings and writes
+PROPOSED orders into the same trade checklist the rebalancer and the AI planner
+use — nothing here can set APPROVED, which is the rule the whole invest module
+is built on. `dry_run` decides whether a run writes to that checklist at all or
+just reports what it saw; either way the user approves each order by hand, at
+their own broker or through the brokerage link.
+
+The signal itself (`signal_for`) is unchanged and still shared with the cash
+planner, so the rules that rank a candidate are the rules that judge a holding.
 """
 
 from __future__ import annotations
@@ -13,15 +22,21 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics.indicators import Indicators, compute_indicators
-from app.db.models import AutoTraderConfig, AutoTradeRun
+from app.db.models import AutoTraderConfig, AutoTradeRun, ProposedOrder
+from app.domain.enums import OrderSide
 from app.integrations.marketdata.provider import MarketDataProvider
+from app.repositories.holdings import HoldingRepository
 from app.repositories.paper import PaperRepository
+from app.repositories.proposed_orders import ProposedOrderRepository
+from app.repositories.user_settings import UserSettingsRepository
 from app.schemas.paper import AutoTraderConfigIn, AutoTraderConfigOut, AutoTradeRunOut
-from app.services.errors import ValidationFailed
+from app.services.invest_service import InvestService
 from app.services.market_data_service import MarketDataService
-from app.services.paper_broker_service import PaperBrokerService
 
 DEFAULT_UNIVERSE = ["SPY", "AAPL", "MSFT", "NVDA", "VFV.TO"]
+
+# Below this a suggestion is not worth the user's attention or the spread.
+MIN_PROPOSAL_CAD = 20.0
 
 
 def signal_for(ind: Indicators, held: bool) -> tuple[float, str, str]:
@@ -54,9 +69,14 @@ def signal_for(ind: Indicators, held: bool) -> tuple[float, str, str]:
 class AutoTraderService:
     def __init__(self, session: AsyncSession, provider: MarketDataProvider) -> None:
         self.session = session
+        # Config and run history still live in the paper tables — they are the
+        # bot's own records, not simulated money.
         self.repo = PaperRepository(session)
         self.market_data = MarketDataService(session, provider)
-        self.broker = PaperBrokerService(session, provider)
+        self.proposals = ProposedOrderRepository(session)
+        self.holdings = HoldingRepository(session)
+        self.user_settings = UserSettingsRepository(session)
+        self.invest = InvestService(session, provider)
 
     async def get_config(self, user_id: uuid.UUID) -> AutoTraderConfigOut:
         cfg = await self.repo.get_or_create_config(user_id)
@@ -83,18 +103,49 @@ class AutoTraderService:
     _signal = staticmethod(signal_for)
 
     async def run(self, user_id: uuid.UUID) -> AutoTradeRunOut:
+        """Scan the universe against the real portfolio and propose.
+
+        The universe is whatever the user configured plus everything they
+        already hold: a scanner that only looks at a fixed list can tell you
+        what to buy but never notices that something you own has turned.
+        """
         cfg = await self.repo.get_or_create_config(user_id)
-        universe = [s for s in cfg.universe.split(",") if s] or DEFAULT_UNIVERSE
-        live = cfg.enabled and not cfg.dry_run
-        positions = {p.symbol: p for p in await self.repo.list_positions(user_id)}
+        configured = [s for s in cfg.universe.split(",") if s] or DEFAULT_UNIVERSE
+
+        # Universe first, from the config plus whatever is actually held, then
+        # price it — `portfolio()` values positions from cached bars, so asking
+        # it before the sync reports an empty book and the bot decides nothing.
+        rows = await self.holdings.list_for_user(user_id)
+        universe: list[str] = []
+        for symbol in [*configured, *(h.symbol for h in rows)]:
+            if symbol.upper() not in universe:
+                universe.append(symbol.upper())
+
+        await self.market_data.sync_bars(universe)
+        await self.session.commit()
+
+        portfolio = await self.invest.portfolio(user_id)
+        positions = {p["symbol"].upper(): p for p in portfolio.positions}
         held_count = len(positions)
+        # Read cash from settings rather than the portfolio: with no holdings
+        # yet, `portfolio()` reports "not connected" and no account at all —
+        # but the cash is real and the bot should be able to deploy it.
+        settings_row = await self.user_settings.get_or_create(user_id)
+        cash = settings_row.invest_cash_cents / 100
+
+        # `enabled` arms the bot; `dry_run` decides whether an armed run writes
+        # to the checklist or only reports. Nothing here ever executes.
+        propose = cfg.enabled and not cfg.dry_run
 
         decisions: list[dict] = []
-        executed = 0
+        orders: list[ProposedOrder] = []
+        batch_id = uuid.uuid4()
+        budget = cash
+
+        series = await self.market_data.get_close_series(universe)
 
         for sym in universe:
-            await self.market_data.sync_bars([sym])
-            closes = [c for _, c in (await self.market_data.get_close_series([sym])).get(sym, [])]
+            closes = [c for _, c in series.get(sym, [])]
             try:
                 ind = compute_indicators(closes)
             except ValueError:
@@ -109,36 +160,43 @@ class AutoTraderService:
                 )
                 continue
 
-            held = sym in positions
+            position = positions.get(sym)
+            held = position is not None
             score, action, reason = self._signal(ind, held)
 
             # Guardrail: never exceed max open positions on new buys.
             if action == "buy" and not held and held_count >= cfg.max_positions:
                 action, reason = "skip", f"at max positions ({cfg.max_positions})"
-            # Only ever sell positions the bot opened itself.
-            if action == "sell" and (not held or positions[sym].opened_by != "autotrader"):
-                action, reason = "hold", "not an auto-trader position — left untouched"
 
-            done = False
-            if live and action == "buy":
-                price = await self.broker.price_cad(sym)
-                qty = int((cfg.per_trade_cents / 100) / price) if price else 0
-                if qty >= 1:
-                    try:
-                        await self.broker.buy(user_id, sym, qty, source="autotrader", note=reason)
-                        done, executed, held_count = True, executed + 1, held_count + 1
-                    except ValidationFailed as exc:
-                        action, reason = "skip", str(exc)
-                else:
-                    action, reason = "skip", "position size below one share"
-            elif live and action == "sell":
-                try:
-                    await self.broker.sell(
-                        user_id, sym, positions[sym].qty, source="autotrader", note=reason
+            amount = 0.0
+            if action == "buy":
+                amount = min(cfg.per_trade_cents / 100, budget)
+                if amount < MIN_PROPOSAL_CAD:
+                    action, reason = "skip", "not enough cash for a trade worth placing"
+            elif action == "sell" and position:
+                # Exit the whole position. The signal is an exit signal, not a
+                # sizing opinion, so inventing a partial would be making up a
+                # decision the rules never took.
+                amount = position["market_value"]
+                if amount < MIN_PROPOSAL_CAD:
+                    action, reason = "hold", "position too small to be worth selling"
+
+            proposed = False
+            if propose and action in ("buy", "sell") and amount >= MIN_PROPOSAL_CAD:
+                orders.append(
+                    self._order(
+                        user_id=user_id,
+                        batch_id=batch_id,
+                        symbol=sym,
+                        side=OrderSide.BUY if action == "buy" else OrderSide.SELL,
+                        amount=amount,
+                        reason=f"Auto-trader: {reason}.",
                     )
-                    done, executed = True, executed + 1
-                except ValidationFailed as exc:
-                    action, reason = "hold", str(exc)
+                )
+                proposed = True
+                if action == "buy":
+                    budget -= amount
+                    held_count += 1
 
             decisions.append(
                 {
@@ -146,22 +204,61 @@ class AutoTraderService:
                     "action": action,
                     "reason": reason,
                     "score": round(score, 2),
-                    "executed": done,
+                    # Kept as `executed` for the stored shape, but nothing is
+                    # executed any more — it means "written to the checklist".
+                    "executed": proposed,
                 }
             )
 
-        mode = "executed live" if live else ("dry-run" if cfg.enabled else "preview (disabled)")
-        summary = f"Scanned {len(universe)} tickers · {executed} trade(s) · {mode}."
+        if orders:
+            # A new batch supersedes anything still open, same as the rebalancer
+            # — two live checklists both looking actionable is worse than one.
+            await self.proposals.expire_open_proposals(user_id)
+            await self.proposals.add_all(orders)
+
+        mode = (
+            "proposed to your checklist"
+            if propose
+            else ("report only (dry run)" if cfg.enabled else "preview (bot disabled)")
+        )
+        summary = (
+            f"Scanned {len(universe)} tickers · {len(orders)} suggestion(s) · {mode}. "
+            "Nothing is placed until you approve each order."
+        )
         run = await self.repo.add_run(
             user_id=user_id,
-            dry_run=not live,
+            dry_run=not propose,
             scanned=len(universe),
-            executed=executed,
+            executed=len(orders),
             summary=summary,
             decisions=decisions,
         )
         await self.session.commit()
         return self._run_out(run)
+
+    def _order(
+        self,
+        *,
+        user_id: uuid.UUID,
+        batch_id: uuid.UUID,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        reason: str,
+    ) -> ProposedOrder:
+        """A dollar-sized PROPOSED order. Never APPROVED, never routed."""
+        return ProposedOrder(
+            user_id=user_id,
+            batch_id=batch_id,
+            kind="autotrader",
+            symbol=symbol,
+            side=side,
+            order_type="market",
+            qty=None,
+            notional_cents=round(amount * 100),
+            est_value_cents=round(amount * 100),
+            reason=reason,
+        )
 
     async def runs(self, user_id: uuid.UUID) -> list[AutoTradeRunOut]:
         return [self._run_out(r) for r in await self.repo.list_runs(user_id)]

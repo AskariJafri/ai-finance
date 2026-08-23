@@ -323,6 +323,8 @@ export type Position = {
   name: string | null;
   qty: number;
   currency: string;
+  /** True when the row is mirrored from a linked brokerage account. */
+  is_synced: boolean;
   price: number;
   avg_cost: number;
   market_value: number; // CAD
@@ -485,7 +487,10 @@ export type ProposedOrder = {
   kind: string;
   symbol: string;
   side: "buy" | "sell";
+  /** Set under share sizing; null when the order is sized in dollars. */
   qty: number | null;
+  /** Set under dollar sizing; null when the order is sized in shares. */
+  notional: number | null;
   est_value: number; // CAD
   reason: string;
   status: string;
@@ -521,6 +526,8 @@ export type BrokerageSyncResponse = {
   positions_synced: number;
   positions_removed: number;
   cash_cents: number;
+  /** Accounts the broker could not be reached for; the rest still synced. */
+  failed_accounts: string[];
 };
 
 export type Proposal = {
@@ -533,16 +540,26 @@ export type Proposal = {
 };
 
 // --- deploy cash ("I have $X to invest") ---
+/**
+ * How a plan is sized. "shares" is whole shares — the only thing that can be
+ * routed to a broker. "dollars" is a notional amount, which is how a
+ * fractional-share broker (Wealthsimple, Questrade) actually lets you buy, and
+ * the only sizing that works on an account too small for one share.
+ */
+export type Sizing = "shares" | "dollars";
+
 export type DeployPlanRequest = {
   amount: number;
-  max_candidates?: number;
+  max_candidates?: number; // how many finalists face the committee (1-12)
+  max_positions?: number; // how many names the amount is split across (1-10)
   use_ai?: boolean;
+  sizing?: Sizing;
 };
 
 export type DeployPick = {
   symbol: string;
   name: string | null;
-  qty: number; // whole shares
+  qty: number; // whole under "shares" sizing, fractional under "dollars"
   price: number; // CAD per share
   est_value: number; // CAD
   weight: number; // share of the amount allocated
@@ -559,6 +576,7 @@ export type DeployPassed = {
 
 export type DeployPlan = {
   amount: number;
+  sizing: Sizing;
   picks: DeployPick[];
   passed: DeployPassed[];
   invested: number;
@@ -571,6 +589,69 @@ export type DeployPlan = {
 
 export type DeployAcceptRequest = {
   orders: { symbol: string; qty: number; price: number; reason: string }[];
+  sizing?: Sizing;
+};
+
+// --- AI portfolio actions (sell + buy over what you already own) ---
+export type ActionPlanRequest = {
+  /** Money being added on top of the cash the app already tracks. */
+  added_cash?: number;
+  max_new_positions?: number; // new names to open (0-6)
+  max_candidates?: number; // unheld tickers that get a committee call (1-10)
+  use_ai?: boolean;
+  sizing?: Sizing;
+};
+
+export type PortfolioAction = {
+  symbol: string;
+  name: string | null;
+  side: "buy" | "sell";
+  /** EXIT and TRIM are sells; ADD tops up a holding, NEW opens a position. */
+  action: "EXIT" | "TRIM" | "ADD" | "NEW";
+  amount: number; // CAD
+  qty: number | null; // null when sized in dollars
+  price: number; // CAD per share
+  current_weight: number;
+  projected_weight: number;
+  confidence: number;
+  reason: string;
+};
+
+/** Something held that the plan deliberately leaves alone. */
+export type ActionHold = {
+  symbol: string;
+  weight: number;
+  confidence: number;
+  reason: string;
+};
+
+export type ActionPlan = {
+  as_of: string;
+  currency: string;
+  equity: number;
+  cash_before: number;
+  cash_after: number;
+  sizing: Sizing;
+  actions: PortfolioAction[];
+  holds: ActionHold[];
+  passed: DeployPassed[];
+  considered: number;
+  /** "mixed" means some verdicts fell back to rules when the model was down. */
+  source: "ai" | "mixed" | "rules";
+  note: string;
+  disclaimer: string;
+};
+
+export type ActionAcceptRequest = {
+  orders: {
+    symbol: string;
+    side: "buy" | "sell";
+    amount: number;
+    price: number;
+    qty?: number | null;
+    reason: string;
+  }[];
+  sizing?: Sizing;
 };
 
 export type Explainer = {

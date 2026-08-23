@@ -11,23 +11,42 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useNavigation } from "@react-navigation/native";
 
-import { useAcceptDeployPlan, useDeployPlan, usePortfolio } from "../../api/hooks";
+import {
+  useAcceptDeployPlan,
+  useBrokerageConnections,
+  useDeployPlan,
+  usePortfolio,
+} from "../../api/hooks";
+import type { Sizing } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { useTheme } from "../../theme";
 import { formatCurrency, formatPercent } from "../../utils/format";
 
 const PRESETS = [500, 1000, 5000] as const;
+// How many names to split across. Fewer, larger positions is the right default
+// on a small amount — whole shares mean a wide split just buys nothing.
+const POSITION_CHOICES = [2, 3, 4, 5] as const;
 
 export function DeployCashScreen() {
   const theme = useTheme();
   const navigation = useNavigation<any>();
   const [amount, setAmount] = useState("1000");
+  const [positions, setPositions] = useState<number>(4);
   const [showPassed, setShowPassed] = useState(false);
+  const [sizing, setSizing] = useState<Sizing | null>(null);
 
   const portfolio = usePortfolio();
+  const connections = useBrokerageConnections();
   const plan = useDeployPlan();
   const accept = useAcceptDeployPlan();
+
+  // A linked broker means fractional shares are buyable, and dollar sizing is
+  // the only thing that works when one share costs more than the whole amount.
+  // Whole shares stay the default without one, since that is what you can
+  // actually place by hand. Once the user picks, their choice wins.
+  const linked = (connections.data ?? []).length > 0;
+  const effectiveSizing: Sizing = sizing ?? (linked ? "dollars" : "shares");
 
   const availableCash = portfolio.data?.account?.cash ?? 0;
   const parsed = Number(amount.replace(/[^0-9.]/g, "")) || 0;
@@ -36,7 +55,7 @@ export function DeployCashScreen() {
   const run = () => {
     if (!(parsed > 0)) return;
     setShowPassed(false);
-    plan.mutate({ amount: parsed });
+    plan.mutate({ amount: parsed, max_positions: positions, sizing: effectiveSizing });
   };
 
   const acceptPlan = () => {
@@ -49,6 +68,7 @@ export function DeployCashScreen() {
           price: p.price,
           reason: p.rationale,
         })),
+        sizing: result.sizing,
       },
       { onSuccess: () => navigation.navigate("Rebalance") },
     );
@@ -97,6 +117,43 @@ export function DeployCashScreen() {
             </Pressable>
           ) : null}
 
+          <Text
+            style={[styles.label, { color: theme.colors.textMuted, marginTop: 16 }]}
+          >
+            Split across up to
+          </Text>
+          <View style={styles.segmentRow}>
+            {POSITION_CHOICES.map((n) => (
+              <Segment
+                key={n}
+                active={positions === n}
+                label={`${n} tickers`}
+                onPress={() => setPositions(n)}
+              />
+            ))}
+          </View>
+
+          <Text style={[styles.label, { color: theme.colors.textMuted, marginTop: 16 }]}>
+            Size each buy in
+          </Text>
+          <View style={styles.segmentRow}>
+            <Segment
+              active={effectiveSizing === "dollars"}
+              label="Dollar amounts"
+              onPress={() => setSizing("dollars")}
+            />
+            <Segment
+              active={effectiveSizing === "shares"}
+              label="Whole shares"
+              onPress={() => setSizing("shares")}
+            />
+          </View>
+          <Text style={[styles.hint, { color: theme.colors.textMuted, marginTop: 6 }]}>
+            {effectiveSizing === "dollars"
+              ? "Spends the full amount and can buy a fraction of a share — Wealthsimple and Questrade both allow this."
+              : "Whole shares only, so some of the amount stays in cash and pricier names may drop out."}
+          </Text>
+
           <Button
             title="Build my plan"
             onPress={run}
@@ -105,8 +162,10 @@ export function DeployCashScreen() {
             style={{ marginTop: 14 }}
           />
           <Text style={[styles.hint, { color: theme.colors.textMuted }]}>
-            A rules pass ranks every candidate, then the AI committee argues over the
-            shortlist — one deliberation per finalist. Give it a few seconds.
+            A rules pass ranks the whole universe, then the AI committee argues over the
+            shortlist — one deliberation per finalist. Give it a few seconds. You may get
+            fewer names than asked for: the committee has to like them
+            {effectiveSizing === "shares" ? ", and each position needs at least one whole share" : ""}.
           </Text>
           {plan.error ? (
             <Text style={{ color: theme.colors.danger, fontSize: 12, marginTop: 8 }}>
@@ -137,8 +196,10 @@ export function DeployCashScreen() {
                     </Text>
                   </View>
                   <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
-                    {p.qty} share{p.qty === 1 ? "" : "s"} @ {formatCurrency(p.price)} ·{" "}
-                    {formatPercent(p.weight)} of the amount · confidence{" "}
+                    {result.sizing === "dollars"
+                      ? `≈ ${p.qty.toFixed(4)} shares @ ${formatCurrency(p.price)}`
+                      : `${p.qty} share${p.qty === 1 ? "" : "s"} @ ${formatCurrency(p.price)}`}{" "}
+                    · {formatPercent(p.weight)} of the amount · confidence{" "}
                     {formatPercent(p.confidence)}
                   </Text>
                   {p.rationale ? (

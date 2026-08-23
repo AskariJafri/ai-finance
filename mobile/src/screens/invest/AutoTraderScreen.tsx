@@ -1,3 +1,4 @@
+import { useNavigation } from "@react-navigation/native";
 import { useState } from "react";
 import {
   ActivityIndicator,
@@ -23,6 +24,7 @@ import { formatCurrency } from "../../utils/format";
 
 export function AutoTraderScreen() {
   const theme = useTheme();
+  const navigation = useNavigation<any>();
   const config = useAutoTraderConfig();
   const update = useUpdateAutoTrader();
   const runMut = useRunAutoTrader();
@@ -42,9 +44,11 @@ export function AutoTraderScreen() {
       <ScrollView contentContainerStyle={{ padding: 16, gap: 14 }}>
         <Text style={[styles.h1, { color: theme.colors.text }]}>Auto-Trader</Text>
         <Text style={[styles.sub, { color: theme.colors.textMuted }]}>
-          A disciplined, rules-based bot that scans a set of tickers and trades the
-          paper account with hard guardrails. It only sells positions it opened,
-          never touches your real holdings, and does nothing until you enable it.
+          A disciplined, rules-based scan of your watch list and everything you
+          already hold. It writes suggestions into your trade checklist — it
+          cannot place an order, and it does nothing at all until you enable it.
+          {"\n\n"}Buys are capped at your per-trade size and your available
+          cash; a sell suggestion only ever covers a position you actually hold.
         </Text>
 
         {config.isLoading || !cfg ? (
@@ -59,7 +63,11 @@ export function AutoTraderScreen() {
                 ]}
               >
                 <Text style={{ color: live ? "#fff" : theme.colors.textMuted, fontWeight: "700", fontSize: 12 }}>
-                  {live ? "LIVE — placing paper trades" : cfg.enabled ? "DRY RUN — preview only" : "DISABLED"}
+                  {live
+                    ? "ARMED — writes to your trade checklist"
+                    : cfg.enabled
+                      ? "DRY RUN — reports only"
+                      : "DISABLED"}
                 </Text>
               </View>
 
@@ -72,7 +80,7 @@ export function AutoTraderScreen() {
               </Row>
               <Row
                 label="Dry run"
-                hint="On = simulate decisions only. Turn OFF to let it actually place paper trades."
+                hint="On = report what it found and stop there. Off = also add those suggestions to your trade checklist, where you approve or skip each one."
               >
                 <Switch
                   value={cfg.dry_run}
@@ -97,6 +105,13 @@ export function AutoTraderScreen() {
             {lastRun ? (
               <Card>
                 <Text style={[styles.cardTitle, { color: theme.colors.text }]}>Latest scan</Text>
+                {lastRun.executed > 0 ? (
+                  <Button
+                    title={`Review ${lastRun.executed} suggestion${lastRun.executed === 1 ? "" : "s"}`}
+                    onPress={() => navigation.navigate("Rebalance")}
+                    style={{ marginTop: 8, marginBottom: 10 }}
+                  />
+                ) : null}
                 <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginBottom: 4 }}>
                   {lastRun.summary}
                 </Text>
@@ -126,7 +141,8 @@ export function AutoTraderScreen() {
                       {new Date(r.created_at).toLocaleString()}
                     </Text>
                     <Text style={{ color: theme.colors.text, fontSize: 12 }}>
-                      {r.executed} trade{r.executed === 1 ? "" : "s"} · {r.dry_run ? "dry" : "live"}
+                      {r.executed} suggestion{r.executed === 1 ? "" : "s"} ·{" "}
+                      {r.dry_run ? "report only" : "checklist"}
                     </Text>
                   </View>
                 ))}
@@ -134,8 +150,10 @@ export function AutoTraderScreen() {
             ) : null}
 
             <Text style={[styles.disclaimer, { color: theme.colors.textMuted }]}>
-              Paper trading only — no real orders. This bot does not beat the
-              market; its value is consistency and risk control. Educational only.
+              Suggestions only — this bot cannot place an order. Every suggestion
+              goes to your trade checklist and needs your approval. It does not
+              beat the market; its value is consistency and risk control.
+              Educational only.
             </Text>
           </>
         )}

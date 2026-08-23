@@ -44,8 +44,21 @@ _TERMINAL_STATES: dict[str, BrokerOrderState] = {
 }
 
 # Exchange code -> Yahoo ticker suffix, so broker symbols join against
-# ``Holding.symbol`` and the market data provider.
-_EXCHANGE_SUFFIX = {"TSX": ".TO", "TSXV": ".V", "CSE": ".CN", "NEO": ".NE"}
+# ``Holding.symbol`` and the market data provider. Both spellings are here on
+# purpose: older payloads carry a friendly code ("TSX"), current ones carry the
+# ISO MIC ("XTSE"). US venues need no suffix, which is what the empty default
+# gives them.
+_EXCHANGE_SUFFIX = {
+    "TSX": ".TO",
+    "XTSE": ".TO",
+    "XTSX": ".TO",
+    "TSXV": ".V",
+    "XTSV": ".V",
+    "CSE": ".CN",
+    "XCNQ": ".CN",
+    "NEO": ".NE",
+    "NEOE": ".NE",
+}
 
 # Personal SnapTrade keys (clientId prefix "PERS-") authenticate via the signed
 # consumerKey alone: there is no ``registerUser`` and no per-user secret — you
@@ -56,8 +69,21 @@ _EXCHANGE_SUFFIX = {"TSX": ".TO", "TSXV": ".V", "CSE": ".CN", "NEO": ".NE"}
 _PERSONAL_SENTINEL = "personal-key-user"
 
 
+def _amount(value: Any) -> Any:
+    """Unwrap SnapTrade's ``{"amount": 478.23, "currency": "CAD"}`` money object.
+
+    Balances nest the figure one level down; quantities and prices are bare
+    numbers (sometimes strings). Passing everything through here means a
+    payload that changes shape costs nothing.
+    """
+    if isinstance(value, dict):
+        return value.get("amount")
+    return value
+
+
 def _to_cents(amount: Any) -> int:
     """Money -> integer cents. ``None``/unparseable becomes 0."""
+    amount = _amount(amount)
     if amount is None:
         return 0
     try:
@@ -66,9 +92,35 @@ def _to_cents(amount: Any) -> int:
         return 0
 
 
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """Quantity/price -> float. SnapTrade sends these as decimal *strings*."""
+    value = _amount(value)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _body(response: Any) -> Any:
     """SDK responses expose ``.body``; tolerate plain dicts/lists too."""
     return getattr(response, "body", response)
+
+
+def _results(response: Any) -> list[Any]:
+    """The rows of a list response, whichever envelope it arrived in.
+
+    Current SnapTrade wraps collections as ``{"results": [...],
+    "data_freshness": {...}}``; older ones returned a bare list. Iterating the
+    dict form directly yields its *keys*, which silently maps to zero rows —
+    that is precisely how a whole portfolio went missing, so the unwrapping is
+    centralized here rather than repeated per endpoint.
+    """
+    body = _body(response)
+    if isinstance(body, dict):
+        body = body.get("results", [])
+    return list(body) if isinstance(body, list) else []
 
 
 def _get(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -93,8 +145,10 @@ def _normalize_ticker(symbol_obj: Any) -> str:
     if "." in ticker:
         return ticker
     exchange = _get(symbol_obj, "exchange", default={})
-    code = str(_get(exchange, "code", "mic_code", default="") or "").upper()
-    return f"{ticker}{_EXCHANGE_SUFFIX.get(code, '')}"
+    # ``exchange`` is a bare MIC string on current payloads and an object on
+    # older ones.
+    code = exchange if isinstance(exchange, str) else _get(exchange, "code", "mic_code", default="")
+    return f"{ticker}{_EXCHANGE_SUFFIX.get(str(code or '').upper(), '')}"
 
 
 def _map_order(raw: Any) -> SnapTradeOrderResult:
@@ -221,20 +275,67 @@ class RealSnapTradeClient(SnapTradeGateway):
             raise SnapTradeError(f"Failed to list accounts: {exc}") from exc
 
         accounts: list[SnapTradeAccount] = []
-        for raw in _body(response) or []:
+        for raw in _results(response):
             balance = _get(raw, "balance", default={})
+            meta = _get(raw, "meta", default={})
+            account_id = str(_get(raw, "id", default=""))
+            # ``meta`` is the reliable source: the top-level ``currency`` comes
+            # back null for Wealthsimple, and ``status`` only appears there on
+            # some payloads.
+            currency = str(_get(meta, "currency") or _get(raw, "currency") or "CAD")
+            status = str(_get(raw, "status") or _get(meta, "status") or "open")
+            is_open = status.lower() not in {"closed", "archived", "deleted"}
+            cash_cents = 0
+            if is_open:
+                cash_cents = await self._cash_cents(
+                    snaptrade_user_id=snaptrade_user_id,
+                    user_secret=user_secret,
+                    account_id=account_id,
+                    currency=currency,
+                )
             accounts.append(
                 SnapTradeAccount(
-                    account_id=str(_get(raw, "id", default="")),
+                    account_id=account_id,
                     name=str(_get(raw, "name", default="Brokerage account")),
                     number_masked=_get(raw, "number"),
                     institution_name=_get(raw, "institution_name", "brokerage"),
-                    currency=str(_get(raw, "currency", default="CAD") or "CAD"),
+                    currency=currency,
+                    # ``balance.total`` is a money object, not a number.
                     total_value_cents=_to_cents(_get(balance, "total", "amount")),
-                    cash_cents=_to_cents(_get(balance, "cash")),
+                    cash_cents=cash_cents,
+                    is_open=is_open,
                 )
             )
         return accounts
+
+    async def _cash_cents(
+        self, *, snaptrade_user_id: str, user_secret: str, account_id: str, currency: str
+    ) -> int:
+        """Settled cash for one account.
+
+        The accounts payload carries only ``balance.total`` (positions plus
+        cash), so cash needs its own call. A failure here costs the cash figure,
+        not the whole account list — the positions are the point.
+        """
+        uid, usecret = self._auth(snaptrade_user_id, user_secret)
+        try:
+            response = await asyncio.to_thread(
+                self._client.account_information.get_user_account_balance,
+                user_id=uid,
+                user_secret=usecret,
+                account_id=account_id,
+            )
+        except Exception as exc:
+            logger.warning("Cash balance unavailable for account %s: %s", account_id, exc)
+            return 0
+
+        total = 0
+        for row in _results(response):
+            code = str(_get(_get(row, "currency", default={}), "code", default="") or "").upper()
+            if code and code != currency.upper():
+                continue
+            total += _to_cents(_get(row, "cash"))
+        return total
 
     async def list_positions(
         self, *, snaptrade_user_id: str, user_secret: str, account_id: str
@@ -251,24 +352,41 @@ class RealSnapTradeClient(SnapTradeGateway):
             raise SnapTradeError(f"Failed to list positions: {exc}") from exc
 
         positions: list[SnapTradePosition] = []
-        for raw in _body(response) or []:
-            symbol_obj = _get(raw, "symbol", default={})
-            # Positions nest the instrument one level deeper than quotes do.
-            inner = _get(symbol_obj, "symbol", default=symbol_obj)
+        for raw in _results(response):
+            # Current payloads put the instrument under ``instrument``; older
+            # ones nested it as ``symbol.symbol``.
+            symbol_obj = _get(raw, "instrument", "symbol", default={})
+            # Legacy payloads nest the instrument a further level down
+            # (``symbol.symbol`` is an object); current ones put the ticker
+            # string there instead, so only descend into a nested object.
+            nested = _get(symbol_obj, "symbol")
+            inner = nested if isinstance(nested, dict) else symbol_obj
             ticker = _normalize_ticker(inner)
             if not ticker:
+                logger.warning("Skipping position with unreadable symbol: %r", raw)
                 continue
-            qty = _get(raw, "units", "fractional_units", default=0) or 0
+            qty = _to_float(_get(raw, "units", "fractional_units"))
+            price = _to_float(_get(raw, "price"))
+            # ``currency`` is a bare code on the position and an object on the
+            # instrument, depending on payload generation.
+            currency_obj = _get(raw, "currency") or _get(inner, "currency", default={})
+            currency = (
+                currency_obj
+                if isinstance(currency_obj, str)
+                else _get(currency_obj, "code", default="CAD")
+            )
+            market_value_cents = _to_cents(_get(raw, "market_value"))
+            if not market_value_cents and price:
+                market_value_cents = _to_cents(qty * price)
             positions.append(
                 SnapTradePosition(
                     symbol=ticker,
                     name=_get(inner, "description", "name"),
-                    qty=float(qty),
-                    avg_cost_cents=_to_cents(_get(raw, "average_purchase_price")),
-                    currency=str(
-                        _get(_get(inner, "currency", default={}), "code", default="CAD") or "CAD"
-                    ),
-                    market_value_cents=_to_cents(_get(raw, "market_value")) or None,
+                    qty=qty,
+                    # Per-share cost. ``cost_basis`` is the current spelling.
+                    avg_cost_cents=_to_cents(_get(raw, "cost_basis", "average_purchase_price")),
+                    currency=str(currency or "CAD").upper(),
+                    market_value_cents=market_value_cents or None,
                 )
             )
         return positions
@@ -295,7 +413,7 @@ class RealSnapTradeClient(SnapTradeGateway):
         except Exception as exc:
             raise SnapTradeError(f"Symbol lookup failed for {ticker}: {exc}") from exc
 
-        for raw in _body(response) or []:
+        for raw in _results(response):
             if _normalize_ticker(raw) == ticker.upper():
                 symbol_id = _get(raw, "id", "universal_symbol_id")
                 if symbol_id:
@@ -368,7 +486,7 @@ class RealSnapTradeClient(SnapTradeGateway):
         except Exception as exc:
             raise SnapTradeError(f"Failed to fetch order status: {exc}") from exc
 
-        for raw in _body(response) or []:
+        for raw in _results(response):
             if str(_get(raw, "brokerage_order_id", "id", default="")) == broker_order_id:
                 return _map_order(raw)
 

@@ -10,39 +10,85 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-import { useInvestSync, usePortfolio } from "../../api/hooks";
+import {
+  useBrokerageConnections,
+  useInvestSync,
+  usePortfolio,
+  useSyncBrokerage,
+} from "../../api/hooks";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { InvestAiCard } from "../../components/InvestAiCard";
+import type { BrokerageConnection } from "../../api/types";
 import { useTheme } from "../../theme";
 import { formatCurrency, formatPercent } from "../../utils/format";
 
+/** "3 minutes ago" — a sync time is only ever read as "how stale is this". */
+function sinceLabel(iso: string | null): string {
+  if (!iso) return "never synced";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms)) return "never synced";
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return "synced just now";
+  if (mins < 60) return `synced ${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `synced ${hours}h ago`;
+  return `synced ${Math.floor(hours / 24)}d ago`;
+}
+
 type NavItem = { screen: string; title: string; subtitle: string };
+type Tile = { screen: string; title: string; glyph: string };
 
-// AI + trading tools — usable without any real holdings entered.
-const AI_CARDS: NavItem[] = [
-  { screen: "DeployCash", title: "Invest Cash", subtitle: "Turn an amount into a concrete buy plan" },
-  { screen: "Committee", title: "AI Committee", subtitle: "Multi-agent BUY / SKIP / HOLD verdict on a stock" },
-  { screen: "PaperTrading", title: "Paper Trading", subtitle: "Practise with $100k of simulated cash" },
-  { screen: "AutoTrader", title: "Auto-Trader", subtitle: "Rules-based bot — safe, off by default" },
-  { screen: "Watchlist", title: "Watchlist", subtitle: "Track tickers with live prices" },
+/**
+ * Three tiers, because eleven equally-weighted cards read as a wall rather
+ * than a menu:
+ *
+ * * **Primary** — the two things you actually open this tab to do. Full width,
+ *   with a sentence explaining them.
+ * * **Tools** — everything else, as a two-column grid of labelled tiles. Same
+ *   destinations, roughly a third of the scroll, scannable as a set.
+ * * **Practice** — the simulated account, kept visually apart so a paper trade
+ *   can never be mistaken for a real one.
+ */
+const PRIMARY: NavItem[] = [
+  {
+    screen: "Actions",
+    title: "What should I do?",
+    subtitle: "AI verdict on every holding — what to sell, what to buy",
+  },
+  {
+    screen: "DeployCash",
+    title: "Invest Cash",
+    subtitle: "Turn an amount into a concrete buy plan",
+  },
 ];
 
-// Analytics over the real holdings you enter.
-const PORTFOLIO_CARDS: NavItem[] = [
-  { screen: "Holdings", title: "Holdings", subtitle: "What you own — add, edit, remove" },
-  { screen: "Risk", title: "Risk", subtitle: "Volatility, VaR, Sharpe, concentration" },
-  { screen: "Projections", title: "Projections", subtitle: "Monte Carlo futures with honest bands" },
-  { screen: "Scenarios", title: "Stress Test", subtitle: "2008, COVID, rate shocks vs your portfolio" },
-  { screen: "Backtest", title: "Backtest & DCA", subtitle: "Test strategies on real history" },
-  { screen: "Rebalance", title: "Rebalance", subtitle: "Targets, drift, trade checklist" },
+const TOOLS: Tile[] = [
+  { screen: "Committee", title: "AI Committee", glyph: "⚖" },
+  { screen: "AutoTrader", title: "Auto-Trader", glyph: "⟳" },
+  { screen: "Watchlist", title: "Watchlist", glyph: "☆" },
+  { screen: "Holdings", title: "Holdings", glyph: "▤" },
+  { screen: "Rebalance", title: "Rebalance", glyph: "⇄" },
+  { screen: "Risk", title: "Risk", glyph: "⚠" },
+  { screen: "Projections", title: "Projections", glyph: "↗" },
+  { screen: "Scenarios", title: "Stress Test", glyph: "⚡" },
+  { screen: "Backtest", title: "Backtest", glyph: "⏱" },
 ];
+
+// The subset that says something useful with an empty portfolio. Offering
+// risk analysis on nothing is just a dead end with a chevron on it.
+const TOOLS_EMPTY: Tile[] = TOOLS.filter((t) =>
+  ["Committee", "Watchlist"].includes(t.screen),
+);
 
 export function InvestHomeScreen() {
   const theme = useTheme();
   const navigation = useNavigation<any>();
   const { data, isLoading, refetch, isRefetching } = usePortfolio();
   const sync = useInvestSync();
+  const connections = useBrokerageConnections();
+  const syncBrokerage = useSyncBrokerage();
+  const linked = connections.data ?? [];
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }} edges={["top"]}>
@@ -63,29 +109,70 @@ export function InvestHomeScreen() {
         </View>
       ) : !data?.connected ? (
         <ScrollView contentContainerStyle={{ padding: 16, gap: 14 }}>
-          <Card>
-            <Text style={[styles.cardTitle, { color: theme.colors.text }]}>
-              Add your holdings to begin
-            </Text>
-            <Text style={[styles.body, { color: theme.colors.textMuted }]}>
-              Tell the app what you own at your broker — Wealthsimple,
-              Questrade, TD, wherever — and it does the rest: risk analysis,
-              stress tests against 2008 and COVID, Monte Carlo projections, and
-              rebalancing suggestions.
-              {"\n\n"}Prices come from public market data, so Canadian listings
-              work natively (VFV.TO, XEQT.TO) alongside US ones (SPY, AAPL),
-              with everything converted to CAD.
-              {"\n\n"}Nothing here places trades. The app tells you what to
-              trade; you place it at your broker and tap "Done".
-            </Text>
-            <Button
-              title="Add holdings"
-              onPress={() => navigation.navigate("Holdings")}
-              style={{ marginTop: 12 }}
-            />
-          </Card>
+          {linked.length > 0 ? (
+            // A linked account with nothing in it here means the mirror has not
+            // run — say that, rather than asking for the holdings the broker
+            // already knows about.
+            <Card>
+              <Text style={[styles.cardTitle, { color: theme.colors.text }]}>
+                Pull in your {linked[0]?.institution_name ?? "brokerage"} positions
+              </Text>
+              <Text style={[styles.body, { color: theme.colors.textMuted }]}>
+                Your account is linked but nothing has been mirrored across yet.
+                Syncing copies your positions in and unlocks risk analysis,
+                stress tests, projections and rebalancing on them.
+              </Text>
+              <Button
+                title={syncBrokerage.isPending ? "Syncing…" : "Sync positions"}
+                onPress={() => syncBrokerage.mutate()}
+                loading={syncBrokerage.isPending}
+                style={{ marginTop: 12 }}
+              />
+              <Button
+                title="Enter holdings by hand"
+                variant="secondary"
+                onPress={() => navigation.navigate("Holdings")}
+                style={{ marginTop: 8 }}
+              />
+            </Card>
+          ) : (
+            <Card>
+              <Text style={[styles.cardTitle, { color: theme.colors.text }]}>
+                Add your holdings to begin
+              </Text>
+              <Text style={[styles.body, { color: theme.colors.textMuted }]}>
+                Link your brokerage in Settings and your positions come across on
+                their own — or tell the app what you own at your broker
+                (Wealthsimple, Questrade, TD, wherever) by hand. Either way it
+                does the rest: risk analysis, stress tests against 2008 and
+                COVID, Monte Carlo projections, and rebalancing suggestions.
+                {"\n\n"}Prices come from public market data, so Canadian listings
+                work natively (VFV.TO, XEQT.TO) alongside US ones (SPY, AAPL),
+                with everything converted to CAD.
+                {"\n\n"}Nothing here places trades. The app tells you what to
+                trade; you place it at your broker and tap "Done".
+              </Text>
+              <Button
+                title="Add holdings"
+                onPress={() => navigation.navigate("Holdings")}
+                style={{ marginTop: 12 }}
+              />
+              <Button
+                title="Link a brokerage"
+                variant="secondary"
+                onPress={() => navigation.navigate("Settings")}
+                style={{ marginTop: 8 }}
+              />
+            </Card>
+          )}
 
-          <NavSection title="AI & Trading" items={AI_CARDS} onNavigate={(s) => navigation.navigate(s)} />
+          <PrimaryActions items={PRIMARY} onNavigate={(s) => navigation.navigate(s)} />
+          <ToolGrid
+            title="Research"
+            items={TOOLS_EMPTY}
+            onNavigate={(s) => navigation.navigate(s)}
+          />
+          <PracticeRow onNavigate={(s) => navigation.navigate(s)} />
         </ScrollView>
       ) : (
         <ScrollView
@@ -117,6 +204,14 @@ export function InvestHomeScreen() {
             ) : null}
           </Card>
 
+          {linked.length > 0 ? (
+            <BrokerageCard
+              connections={linked}
+              onSync={() => syncBrokerage.mutate()}
+              syncing={syncBrokerage.isPending}
+            />
+          ) : null}
+
           <Card>
             <Text style={[styles.cardTitle, { color: theme.colors.text }]}>Positions</Text>
             {data.positions.map((p) => (
@@ -127,6 +222,7 @@ export function InvestHomeScreen() {
                     <Text style={{ color: theme.colors.textMuted, fontWeight: "400", fontSize: 12 }}>
                       {"  "}
                       {formatPercent(p.weight)}
+                      {p.is_synced ? "  · from your broker" : ""}
                     </Text>
                   </Text>
                   <View style={[styles.weightTrack, { backgroundColor: theme.colors.surfaceAlt }]}>
@@ -156,8 +252,9 @@ export function InvestHomeScreen() {
             ))}
           </Card>
 
-          <NavSection title="AI & Trading" items={AI_CARDS} onNavigate={(s) => navigation.navigate(s)} />
-          <NavSection title="Portfolio analysis" items={PORTFOLIO_CARDS} onNavigate={(s) => navigation.navigate(s)} />
+          <PrimaryActions items={PRIMARY} onNavigate={(s) => navigation.navigate(s)} />
+          <ToolGrid title="Tools" items={TOOLS} onNavigate={(s) => navigation.navigate(s)} />
+          <PracticeRow onNavigate={(s) => navigation.navigate(s)} />
 
           <Card>
             <Text style={[styles.cardTitle, { color: theme.colors.text, marginBottom: 10 }]}>
@@ -175,22 +272,72 @@ export function InvestHomeScreen() {
   );
 }
 
-function NavSection({
-  title,
+function BrokerageCard({
+  connections,
+  onSync,
+  syncing,
+}: {
+  connections: BrokerageConnection[];
+  onSync: () => void;
+  syncing: boolean;
+}) {
+  const theme = useTheme();
+  const newest = connections
+    .map((c) => c.last_synced_at)
+    .filter((v): v is string => !!v)
+    .sort()
+    .pop();
+  return (
+    <Card>
+      <View style={styles.navRow}>
+        <Text style={[styles.cardTitle, { color: theme.colors.text, flex: 1 }]}>
+          Linked brokerage
+        </Text>
+        <Pressable onPress={onSync} hitSlop={8} disabled={syncing}>
+          <Text style={{ color: theme.colors.primary, fontWeight: "600" }}>
+            {syncing ? "Syncing…" : "Sync positions"}
+          </Text>
+        </Pressable>
+      </View>
+      {connections.map((c) => (
+        <View key={c.id} style={{ marginTop: 10 }}>
+          <Text style={{ color: theme.colors.text, fontWeight: "600" }}>
+            {c.institution_name ?? "Brokerage"} · {c.account_name ?? "Account"}
+            {c.number_masked ? ` ${c.number_masked}` : ""}
+          </Text>
+          <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginTop: 2 }}>
+            {formatCurrency(c.total_value)} · {formatCurrency(c.cash)} cash ·{" "}
+            {c.currency}
+          </Text>
+          <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 2 }}>
+            {c.trading_enabled
+              ? "Trading enabled — orders you approve are sent here."
+              : "Read-only — positions sync, orders can't be placed."}
+          </Text>
+        </View>
+      ))}
+      <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 10 }}>
+        {sinceLabel(newest ?? null)}
+      </Text>
+    </Card>
+  );
+}
+
+/** The two headline actions: full width, explained, visually the loudest thing
+ *  under the portfolio value. */
+function PrimaryActions({
   items,
   onNavigate,
 }: {
-  title: string;
   items: NavItem[];
   onNavigate: (screen: string) => void;
 }) {
   const theme = useTheme();
   return (
     <View style={{ gap: 10 }}>
-      <Text style={[styles.sectionTitle, { color: theme.colors.textMuted }]}>{title}</Text>
       {items.map((c) => (
         <Pressable key={c.screen} onPress={() => onNavigate(c.screen)}>
-          <Card>
+          <Card style={{ borderColor: theme.colors.primary, borderWidth: 1 }}>
             <View style={styles.navRow}>
               <View style={{ flex: 1 }}>
                 <Text style={[styles.cardTitle, { color: theme.colors.text }]}>{c.title}</Text>
@@ -198,12 +345,88 @@ function NavSection({
                   {c.subtitle}
                 </Text>
               </View>
-              <Text style={{ color: theme.colors.textMuted, fontSize: 20 }}>›</Text>
+              <Text style={{ color: theme.colors.primary, fontSize: 20 }}>›</Text>
             </View>
           </Card>
         </Pressable>
       ))}
     </View>
+  );
+}
+
+/** Everything else, two per row. A tile is a glyph and a label — the subtitle
+ *  each of these used to carry is what made the old list a wall of text. */
+function ToolGrid({
+  title,
+  items,
+  onNavigate,
+}: {
+  title: string;
+  items: Tile[];
+  onNavigate: (screen: string) => void;
+}) {
+  const theme = useTheme();
+  return (
+    <View style={{ gap: 10 }}>
+      <Text style={[styles.sectionTitle, { color: theme.colors.textMuted }]}>{title}</Text>
+      <View style={styles.grid}>
+        {items.map((t) => (
+          <Pressable
+            key={t.screen}
+            onPress={() => onNavigate(t.screen)}
+            style={styles.tileWrap}
+            accessibilityRole="button"
+            accessibilityLabel={t.title}
+          >
+            <View
+              style={[
+                styles.tile,
+                {
+                  backgroundColor: theme.colors.surface,
+                  borderColor: theme.colors.border,
+                  borderRadius: theme.radius.lg,
+                },
+              ]}
+            >
+              <Text style={{ color: theme.colors.primary, fontSize: 20 }}>{t.glyph}</Text>
+              <Text
+                numberOfLines={1}
+                style={{ color: theme.colors.text, fontSize: 14, fontWeight: "600" }}
+              >
+                {t.title}
+              </Text>
+            </View>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+/** Deliberately unlike everything above it: dashed, muted, and labelled as
+ *  simulated, so it never blends into the real-money surface. */
+function PracticeRow({ onNavigate }: { onNavigate: (screen: string) => void }) {
+  const theme = useTheme();
+  return (
+    <Pressable onPress={() => onNavigate("Paper")}>
+      <View
+        style={[
+          styles.practice,
+          { borderColor: theme.colors.border, borderRadius: theme.radius.lg },
+        ]}
+      >
+        <Text style={{ color: theme.colors.textMuted, fontSize: 18 }}>◇</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={{ color: theme.colors.text, fontSize: 15, fontWeight: "600" }}>
+            Practice trading
+          </Text>
+          <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 1 }}>
+            Simulated money — nothing here touches your broker
+          </Text>
+        </View>
+        <Text style={{ color: theme.colors.textMuted, fontSize: 20 }}>›</Text>
+      </View>
+    </Pressable>
   );
 }
 
@@ -234,5 +457,25 @@ const styles = StyleSheet.create({
   weightTrack: { height: 6, borderRadius: 3, marginTop: 6, overflow: "hidden" },
   weightFill: { height: 6, borderRadius: 3 },
   navRow: { flexDirection: "row", alignItems: "center" },
+  grid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", gap: 10 },
+  // Two per row: half the width, minus half the 10pt gutter.
+  tileWrap: { width: "48%" },
+  tile: {
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    gap: 6,
+    minHeight: 76,
+    justifyContent: "center",
+  },
+  practice: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    borderWidth: 1,
+    borderStyle: "dashed",
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
   disclaimer: { fontSize: 11, lineHeight: 15, textAlign: "center", paddingBottom: 8 },
 });

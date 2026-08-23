@@ -20,10 +20,11 @@ import { TransactionsScreen } from "../screens/TransactionsScreen";
 import { AutoTraderScreen } from "../screens/invest/AutoTraderScreen";
 import { BacktestScreen } from "../screens/invest/BacktestScreen";
 import { CommitteeScreen } from "../screens/invest/CommitteeScreen";
+import { ActionsScreen } from "../screens/invest/ActionsScreen";
 import { DeployCashScreen } from "../screens/invest/DeployCashScreen";
 import { HoldingsScreen } from "../screens/invest/HoldingsScreen";
 import { InvestHomeScreen } from "../screens/invest/InvestHomeScreen";
-import { PaperTradingScreen } from "../screens/invest/PaperTradingScreen";
+import { PaperTradingScreen } from "../screens/paper/PaperTradingScreen";
 import { ProjectionsScreen } from "../screens/invest/ProjectionsScreen";
 import { RebalanceScreen } from "../screens/invest/RebalanceScreen";
 import { RiskScreen } from "../screens/invest/RiskScreen";
@@ -75,13 +76,13 @@ function InvestStack() {
         options={{ title: "" }}
       />
       <InvestNav.Screen
-        name="DeployCash"
-        component={DeployCashScreen}
+        name="Actions"
+        component={ActionsScreen}
         options={{ title: "" }}
       />
       <InvestNav.Screen
-        name="PaperTrading"
-        component={PaperTradingScreen}
+        name="DeployCash"
+        component={DeployCashScreen}
         options={{ title: "" }}
       />
       <InvestNav.Screen
@@ -106,11 +107,30 @@ function InvestStack() {
         component={RebalanceScreen}
         options={{ title: "" }}
       />
+      {/* Practice trading. It sits inside Invest but is titled as simulated
+          everywhere it surfaces, so a paper trade can never read as a real one. */}
+      <InvestNav.Screen
+        name="Paper"
+        component={PaperTradingScreen}
+        options={{ title: "Practice · simulated money" }}
+      />
     </InvestNav.Navigator>
     </ErrorBoundary>
   );
 }
 
+function TabIcon({ glyph, color }: { glyph: string; color: string }) {
+  return <Text style={{ color, fontSize: 18 }}>{glyph}</Text>;
+}
+
+/**
+ * Five tabs, deliberately. iOS collapses anything past five into a "More" list
+ * and Material caps at five, so a sixth tab costs more than it adds.
+ *
+ * Settings is reached by the gear in the Dashboard header — somewhere you go
+ * occasionally, not a peer of the sections you live in. Practice trading sits
+ * inside Invest for the same reason.
+ */
 function Tabs() {
   const theme = useTheme();
   return (
@@ -128,32 +148,27 @@ function Tabs() {
       <Tab.Screen
         name="Dashboard"
         component={DashboardScreen}
-        options={{ tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 18 }}>◎</Text> }}
+        options={{ tabBarIcon: ({ color }) => <TabIcon glyph="◎" color={color} /> }}
       />
       <Tab.Screen
         name="Transactions"
         component={TransactionsScreen}
-        options={{ tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 18 }}>≡</Text> }}
+        options={{ tabBarIcon: ({ color }) => <TabIcon glyph="≡" color={color} /> }}
       />
       <Tab.Screen
         name="Insights"
         component={InsightsScreen}
-        options={{ tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 18 }}>◐</Text> }}
+        options={{ tabBarIcon: ({ color }) => <TabIcon glyph="◐" color={color} /> }}
       />
       <Tab.Screen
         name="Invest"
         component={InvestStack}
-        options={{ tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 18 }}>▲</Text> }}
+        options={{ tabBarIcon: ({ color }) => <TabIcon glyph="▲" color={color} /> }}
       />
       <Tab.Screen
         name="Ask"
         component={ChatScreen}
-        options={{ tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 18 }}>✦</Text> }}
-      />
-      <Tab.Screen
-        name="Settings"
-        component={SettingsScreen}
-        options={{ tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 18 }}>⚙</Text> }}
+        options={{ tabBarIcon: ({ color }) => <TabIcon glyph="✦" color={color} /> }}
       />
     </Tab.Navigator>
   );
@@ -193,6 +208,13 @@ export function RootNavigator() {
       {status === "authenticated" ? (
         <Stack.Navigator>
           <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
+          {/* Pushed from the Dashboard gear, and still reachable as
+              navigate("Settings") from any nested screen. */}
+          <Stack.Screen
+            name="Settings"
+            component={SettingsScreen}
+            options={{ presentation: "modal", headerShown: false }}
+          />
           <Stack.Screen
             name="LinkBank"
             component={LinkBankScreen}

@@ -28,6 +28,7 @@ import { Card } from "../components/Card";
 import { useAppConfig } from "../stores/appConfig";
 import { useSession } from "../stores/session";
 import { useTheme } from "../theme";
+import { formatCurrency } from "../utils/format";
 
 export function SettingsScreen() {
   const theme = useTheme();
@@ -138,8 +139,18 @@ export function SettingsScreen() {
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }} edges={["top"]}>
-      <ScrollView contentContainerStyle={{ padding: 16, gap: 14 }}>
+      {/* Presented as a modal from the Dashboard gear, so it carries its own
+          dismiss rather than relying on a back gesture. */}
+      <View style={styles.headerRow}>
         <Text style={[styles.h1, { color: theme.colors.text }]}>Settings</Text>
+        <Pressable onPress={() => navigation.goBack()} hitSlop={8}>
+          <Text style={{ color: theme.colors.primary, fontSize: 16, fontWeight: "600" }}>
+            Done
+          </Text>
+        </Pressable>
+      </View>
+
+      <ScrollView contentContainerStyle={{ padding: 16, paddingTop: 4, gap: 14 }}>
 
         {/* Server connection */}
         <Card>
@@ -304,10 +315,17 @@ export function SettingsScreen() {
                     {c.institution_name ?? "Brokerage"} · {c.account_name ?? "Account"}
                     {c.number_masked ? ` ${c.number_masked}` : ""}
                   </Text>
+                  <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginTop: 2 }}>
+                    {formatCurrency(c.total_value)} · {formatCurrency(c.cash)} cash ·{" "}
+                    {c.currency}
+                  </Text>
                   <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 2 }}>
                     {c.trading_enabled
                       ? "Trading enabled — orders you approve are sent here."
                       : "Read-only — positions sync, but orders can't be placed."}
+                    {c.last_synced_at
+                      ? ` Last synced ${new Date(c.last_synced_at).toLocaleString()}.`
+                      : " Not synced yet."}
                   </Text>
                 </View>
               ))}
@@ -360,6 +378,14 @@ function field(theme: ReturnType<typeof useTheme>) {
 }
 
 const styles = StyleSheet.create({
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 4,
+  },
   h1: { fontSize: 28, fontWeight: "800" },
   cardTitle: { fontSize: 16, fontWeight: "700" },
   help: { fontSize: 13, marginTop: 6, lineHeight: 18 },

@@ -11,6 +11,12 @@ costs an LLM request and the free tier meters those per day:
      cached bars, no LLM, so it costs nothing to run over everything;
   2. put only the top few through the AI committee, concurrently.
 
+The pool is `DEPLOY_UNIVERSE` (below) plus whatever the user watches. It is a
+fixed list rather than "every listed ticker" for a structural reason: the
+market-data provider exposes quotes and bars per symbol and has no screener, so
+"all tickers" would mean tens of thousands of round trips. Stage 1 is free
+though, so the list can be as wide as the bar cache can carry — widen it there.
+
 Guardrails, same as everywhere else in this module: every figure comes from
 market data (the LLM only interprets), sizing is whole shares because a
 fractional qty cannot be routed to a broker, and the engine only ever PROPOSES —
@@ -19,7 +25,9 @@ nothing here may set APPROVED.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from datetime import date, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +50,7 @@ from app.schemas.invest import (
     DeployPlanIn,
     DeployPlanOut,
     ProposalOut,
+    Sizing,
 )
 from app.services.autotrader_service import DEFAULT_UNIVERSE, signal_for
 from app.services.errors import ValidationFailed
@@ -49,6 +58,65 @@ from app.services.invest_service import order_out
 from app.services.market_data_service import MarketDataService
 
 logger = get_logger(__name__)
+
+# The scan pool. Canadian-listed first (the user banks in CAD, and a .TO holding
+# avoids the FX spread on every buy), then US mega caps and core ETFs reachable
+# from any Canadian brokerage. Yahoo tickers — a symbol that stops resolving
+# degrades to one "unpriced" line, so a stale entry here is not a failure.
+# fmt: off
+# Grouped by sector on purpose — one symbol per line would bury that, and the
+# grouping is what makes an omission obvious when editing the list.
+DEPLOY_UNIVERSE = [
+    # One-decision ETFs — for most people this is the whole right answer.
+    "XEQT.TO", "VEQT.TO", "VGRO.TO", "XGRO.TO", "VBAL.TO",
+    "VFV.TO", "ZSP.TO", "XUU.TO", "XAW.TO", "XIC.TO", "VCN.TO",
+    "ZAG.TO", "XBB.TO",
+    # Canadian large caps, by sector.
+    "RY.TO", "TD.TO", "BNS.TO", "BMO.TO", "CM.TO", "NA.TO",
+    "MFC.TO", "SLF.TO", "IFC.TO", "BN.TO",
+    "ENB.TO", "TRP.TO", "CNQ.TO", "SU.TO", "PPL.TO",
+    "CNR.TO", "CP.TO", "WCN.TO", "TFII.TO",
+    "BCE.TO", "T.TO", "RCI-B.TO",
+    "SHOP.TO", "CSU.TO", "ATD.TO", "L.TO", "MRU.TO", "DOL.TO",
+    "FTS.TO", "EMA.TO", "AQN.TO",
+    "AEM.TO", "ABX.TO", "WPM.TO", "NTR.TO", "TECK-B.TO", "CCO.TO",
+    # US core ETFs.
+    "SPY", "QQQ", "VTI", "SCHD", "BND",
+    # US mega caps.
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "TSLA",
+    "BRK-B", "JPM", "V", "MA", "COST", "WMT", "HD", "MCD",
+    "UNH", "JNJ", "LLY", "PG", "KO", "PEP", "XOM", "NFLX",
+]
+# fmt: on
+
+# Indicators reach back six months (`ret_6m`); two years gives them room and
+# keeps a cold scan of the universe cheap. Backtests still pull full history.
+SCAN_HISTORY_DAYS = 730
+
+# A name may run past its conviction target to soak up leftover cash, but not
+# past this share of the amount — otherwise the cheapest ETF absorbs the whole
+# plan and "split across tickers" quietly becomes one ticker.
+CONCENTRATION_CAP = 0.40
+
+# How far past its conviction slice one share may cost and still earn the name a
+# place in the plan. Without it a $600 share could never join a $1,000 two-way
+# split; much above it and a low-conviction name buys in on price alone.
+SEED_TOLERANCE = 1.5
+
+# The remainder sweep buys one share per step, so it is bounded rather than
+# left to iterate on a large amount against a penny stock. Whatever is still
+# unspent when it runs out simply stays in cash.
+MAX_SWEEP_STEPS = 500
+
+# `passed` is shown in the app, so it stays a readable list of near-misses
+# rather than a dump of every symbol the scan touched. `considered` carries the
+# real scan size.
+MAX_PASSED_REPORTED = 20
+NEAR_MISSES_REPORTED = 3
+
+# Ordering for that list: what the committee actually judged first, what merely
+# ranked low last.
+_PASSED_PRIORITY = {"too-expensive": 0, "SKIP": 1, "HOLD": 1, "not-shortlisted": 3, "unpriced": 4}
 
 
 class DeployService:
@@ -73,7 +141,9 @@ class DeployService:
 
         # One sync for the whole pool. Bad tickers land in `failed` rather than
         # raising, so an unknown symbol costs us that candidate, not the request.
-        await self.market_data.sync_bars(pool)
+        await self.market_data.sync_bars(
+            pool, since=date.today() - timedelta(days=SCAN_HISTORY_DAYS)
+        )
         await self.session.commit()
 
         ranked, passed = await self._rank(pool)
@@ -88,12 +158,12 @@ class DeployService:
             )
 
         finalists = ranked[: body.max_candidates]
-        for _, symbol, _ in ranked[body.max_candidates :]:
+        for _, symbol, _, _ in ranked[body.max_candidates :][:NEAR_MISSES_REPORTED]:
             passed.append(
                 DeployPassedOut(
                     symbol=symbol,
                     action="not-shortlisted",
-                    reason="ranked below the shortlist on trend and momentum.",
+                    reason="ranked just below the shortlist on trend and momentum.",
                 )
             )
 
@@ -112,25 +182,35 @@ class DeployService:
 
         prices = {sym: price for sym, _, _, price in quoted}
         names = {sym: quote.get("name") for sym, quote, _, _ in quoted}
-        return self._size(body.amount, results, prices, names, passed, len(pool), source)
+        return self._size(
+            body.amount,
+            results,
+            prices,
+            names,
+            passed,
+            len(pool),
+            source,
+            body.max_positions,
+            body.sizing,
+        )
 
     async def _candidate_pool(self, user_id: uuid.UUID) -> list[str]:
-        """Watchlist first, topped up from the default universe. Anything already
-        held is excluded — this plans new positions, not top-ups."""
+        """Watchlist first, then the whole scan universe. Anything already held
+        is excluded — this plans new positions, not top-ups."""
         watched = [i.symbol.upper() for i in await self.watchlist.list_for_user(user_id)]
         held = {h.symbol.upper() for h in await self.holdings.list_for_user(user_id)}
         pool: list[str] = []
-        for symbol in [*watched, *DEFAULT_UNIVERSE]:
+        for symbol in [*watched, *DEPLOY_UNIVERSE, *DEFAULT_UNIVERSE]:
             if symbol not in pool and symbol not in held:
                 pool.append(symbol)
         return pool
 
     async def _rank(
         self, pool: list[str]
-    ) -> tuple[list[tuple[float, str, Indicators]], list[DeployPassedOut]]:
+    ) -> tuple[list[tuple[float, str, Indicators, str]], list[DeployPassedOut]]:
         """Stage 1 — score every candidate on cached bars. Zero LLM calls."""
         series = await self.market_data.get_close_series(pool)
-        ranked: list[tuple[float, str, Indicators]] = []
+        ranked: list[tuple[float, str, Indicators, str]] = []
         passed: list[DeployPassedOut] = []
 
         for symbol in pool:
@@ -146,30 +226,52 @@ class DeployService:
                     )
                 )
                 continue
-            score, _, _ = signal_for(ind, held=False)
-            ranked.append((score, symbol, ind))
+            score, action, _ = signal_for(ind, held=False)
+            ranked.append((score, symbol, ind, action))
 
-        ranked.sort(key=lambda r: r[0], reverse=True)
+        # Anything the pre-committed rules would actually buy outranks a
+        # merely high-scoring "no edge" name, so the committee spends its
+        # (metered) calls on real candidates first.
+        ranked.sort(key=lambda r: (r[3] == "buy", r[0]), reverse=True)
         return ranked, passed
 
     async def _quote(
-        self, finalists: list[tuple[float, str, Indicators]]
+        self, finalists: list[tuple[float, str, Indicators, str]]
     ) -> tuple[list[tuple[str, dict, Indicators, float]], list[DeployPassedOut]]:
-        """Live quote + CAD price for each shortlisted candidate."""
+        """Live quote + CAD price for each shortlisted candidate.
+
+        Quotes are fetched concurrently; the FX rate is read once for the whole
+        batch rather than per symbol (`sync_bars` always caches USDCAD=X, so it
+        is warm by now). Nothing here touches the session concurrently.
+        """
+        symbols = [symbol for _, symbol, _, _ in finalists]
+        indicators = {symbol: ind for _, symbol, ind, _ in finalists}
+
+        async def one(symbol: str):
+            try:
+                return symbol, await self.provider.get_quote(symbol), None
+            except MarketDataError as exc:
+                return symbol, None, exc
+
+        results = await asyncio.gather(*(one(s) for s in symbols))
+        fx = await self.market_data.latest_fx_rate()
+
         quoted: list[tuple[str, dict, Indicators, float]] = []
         unpriced: list[DeployPassedOut] = []
-
-        for _, symbol, ind in finalists:
-            try:
-                quote = await self.provider.get_quote(symbol)
-            except MarketDataError:
+        for symbol, quote, error in results:
+            if error is not None or quote is None:
                 unpriced.append(
                     DeployPassedOut(
                         symbol=symbol, action="unpriced", reason="no live quote available."
                     )
                 )
                 continue
-            price_cad = await self._to_cad(quote.price, quote.currency)
+            # The quote's own currency, not a guess from a `.TO` suffix.
+            price_cad = (
+                round(quote.price, 4)
+                if quote.currency == "CAD"
+                else (round(quote.price * fx, 4) if fx else None)
+            )
             if not price_cad:
                 unpriced.append(
                     DeployPassedOut(
@@ -187,21 +289,11 @@ class DeployService:
                         "currency": quote.currency,
                         "name": quote.name,
                     },
-                    ind,
+                    indicators[symbol],
                     price_cad,
                 )
             )
         return quoted, unpriced
-
-    async def _to_cad(self, price: float, currency: str) -> float | None:
-        """`sync_bars` always caches USDCAD=X, so the rate is warm by now.
-
-        Uses the quote's own currency rather than guessing from a `.TO` suffix.
-        """
-        if currency == "CAD":
-            return round(price, 4)
-        fx = await self.market_data.latest_fx_rate()
-        return round(price * fx, 4) if fx else None
 
     async def _llm_ready(self) -> bool:
         try:
@@ -219,11 +311,17 @@ class DeployService:
         passed: list[DeployPassedOut],
         considered: int,
         source: str,
+        max_positions: int,
+        sizing: Sizing = "shares",
     ) -> DeployPlanOut:
         """Allocate the budget across BUY verdicts, weighted by confidence.
 
-        Whole shares only: `BrokerageService.approve_and_submit` refuses to route
-        a fractional qty, so anything else produces orders that can't execute.
+        Two sizings. Under ``shares`` the plan is whole shares, because
+        `BrokerageService.approve_and_submit` refuses to route a fractional qty
+        — anything else produces orders that can't execute. Under ``dollars``
+        the conviction weights are spent as-is, which is what a fractional-share
+        broker takes and the only sizing that does anything useful on an account
+        too small to buy one share of what it wants.
         """
         winners = [r for r in results if r.get("action") == "BUY"]
         for r in results:
@@ -247,38 +345,65 @@ class DeployService:
                 "Holding cash is a position too.",
             )
 
+        # Conviction order, then cut to the number of positions asked for. A
+        # small amount spread over many names buys nothing at all, so this is
+        # what keeps the plan executable rather than merely diversified.
+        winners.sort(key=lambda r: float(r.get("confidence") or 0), reverse=True)
+        for r in winners[max_positions:]:
+            passed.append(
+                DeployPassedOut(
+                    symbol=r["symbol"],
+                    action="not-shortlisted",
+                    confidence=r.get("confidence"),
+                    reason=(
+                        f"a buy, but ranked outside the {max_positions}-position "
+                        "limit for this plan."
+                    ),
+                )
+            )
+        winners = winners[:max_positions]
+
         # Confidence is floored so a zero-confidence BUY still gets a slice
         # rather than dividing by zero.
         confidences = {r["symbol"]: max(float(r.get("confidence") or 0), 0.01) for r in winners}
         total_conf = sum(confidences.values())
+        targets = {symbol: conf / total_conf for symbol, conf in confidences.items()}
+
+        if sizing == "dollars":
+            return self._size_by_dollars(
+                amount, winners, targets, prices, names, passed, considered, source
+            )
+
+        qty = self._allocate(amount, targets, prices)
 
         picks: list[DeployPickOut] = []
         for r in winners:
             symbol = r["symbol"]
-            weight = confidences[symbol] / total_conf
             price = prices[symbol]
-            qty = int((amount * weight) // price)
-            if qty < 1:
+            if qty[symbol] < 1:
                 passed.append(
                     DeployPassedOut(
                         symbol=symbol,
                         action="too-expensive",
                         confidence=r.get("confidence"),
                         reason=(
-                            f"one share is ${price:,.2f} CAD, above its "
-                            f"${amount * weight:,.2f} slice of this amount."
+                            f"one share is ${price:,.2f} CAD — more than was left "
+                            f"once the rest of the plan was funded."
                         ),
                     )
                 )
                 continue
+            est_value = round(qty[symbol] * price, 2)
             picks.append(
                 DeployPickOut(
                     symbol=symbol,
                     name=names.get(symbol),
-                    qty=qty,
+                    qty=qty[symbol],
                     price=price,
-                    est_value=round(qty * price, 2),
-                    weight=round(weight, 4),
+                    # The share of the amount this pick actually got, not the
+                    # target it was aiming at — whole shares rarely hit it.
+                    weight=round(est_value / amount, 4),
+                    est_value=est_value,
                     confidence=round(float(r.get("confidence") or 0), 2),
                     rationale=str(r.get("summary") or "").strip()[:500],
                 )
@@ -289,25 +414,31 @@ class DeployService:
         remaining = round(amount - invested, 2)
 
         if not picks:
+            cheapest = min(prices[r["symbol"]] for r in winners)
             return self._empty_plan(
                 amount,
                 passed,
                 considered,
                 source,
-                "Every pick costs more per share than its slice of this amount — "
-                "try a larger amount.",
+                f"${amount:,.2f} doesn't cover a single share of anything the "
+                f"committee liked — the cheapest was ${cheapest:,.2f}. Try a "
+                "larger amount, or add a lower-priced ETF to your watchlist.",
             )
 
+        split = ", ".join(
+            f"{p.qty}× {p.symbol} ≈ ${p.est_value:,.0f} ({p.weight * 100:.0f}%)" for p in picks
+        )
         note = (
-            f"{len(picks)} buy(s) using ${invested:,.2f} of ${amount:,.2f}; "
-            f"${remaining:,.2f} stays in cash (whole shares only). "
+            f"Split ${invested:,.2f} of ${amount:,.2f} across {len(picks)} position(s): "
+            f"{split}. ${remaining:,.2f} stays in cash (whole shares only). "
             "Accepting adds these to your trade checklist — nothing is placed until "
             "you approve each one."
         )
         return DeployPlanOut(
             amount=round(amount, 2),
+            sizing="shares",
             picks=picks,
-            passed=passed,
+            passed=self._trim_passed(passed),
             invested=invested,
             cash_remaining=remaining,
             considered=considered,
@@ -315,18 +446,228 @@ class DeployService:
             note=note,
         )
 
+    def _size_by_dollars(
+        self,
+        amount: float,
+        winners: list[dict],
+        targets: dict[str, float],
+        prices: dict[str, float],
+        names: dict[str, str | None],
+        passed: list[DeployPassedOut],
+        considered: int,
+        source: str,
+    ) -> DeployPlanOut:
+        """Spend the conviction weights directly, as dollar amounts.
+
+        No seed/fill/sweep: without the whole-share constraint the target
+        weights are simply achievable, so the allocation *is* the answer. The
+        concentration cap still applies — conviction alone should not put 80% of
+        the money in one name — and whatever the cap trims is redistributed over
+        the rest rather than left in cash.
+        """
+        capped: dict[str, float] = {}
+        spill = 0.0
+        for symbol, weight in targets.items():
+            share = min(weight, CONCENTRATION_CAP)
+            spill += weight - share
+            capped[symbol] = share
+
+        # Redistribute what the cap took, proportionally among names with room.
+        for _ in range(3):
+            if spill <= 1e-9:
+                break
+            room = {s: CONCENTRATION_CAP - w for s, w in capped.items() if w < CONCENTRATION_CAP}
+            total_room = sum(room.values())
+            if total_room <= 1e-9:
+                break
+            moved = min(spill, total_room)
+            for symbol, available in room.items():
+                capped[symbol] += moved * (available / total_room)
+            spill -= moved
+
+        picks: list[DeployPickOut] = []
+        for r in winners:
+            symbol = r["symbol"]
+            allocation = round(amount * capped[symbol], 2)
+            if allocation < 1.0:
+                passed.append(
+                    DeployPassedOut(
+                        symbol=symbol,
+                        action="too-expensive",
+                        confidence=r.get("confidence"),
+                        reason="its slice of the amount came to under a dollar.",
+                    )
+                )
+                continue
+            price = prices[symbol]
+            picks.append(
+                DeployPickOut(
+                    symbol=symbol,
+                    name=names.get(symbol),
+                    qty=round(allocation / price, 4),
+                    price=price,
+                    weight=round(allocation / amount, 4),
+                    est_value=allocation,
+                    confidence=round(float(r.get("confidence") or 0), 2),
+                    rationale=str(r.get("summary") or "").strip()[:500],
+                )
+            )
+
+        if not picks:
+            return self._empty_plan(
+                amount,
+                passed,
+                considered,
+                source,
+                f"${amount:,.2f} is too small to split across the names the "
+                "committee liked. Try a larger amount.",
+                sizing="dollars",
+            )
+
+        picks.sort(key=lambda p: p.est_value, reverse=True)
+
+        # Rounding each slice to the cent can land a cent or two either side of
+        # the amount. Absorb the difference into the largest position so the
+        # plan never proposes spending more than the user actually has.
+        drift = round(round(sum(p.est_value for p in picks), 2) - amount, 2)
+        if drift and picks:
+            largest = picks[0]
+            adjusted = round(largest.est_value - drift, 2)
+            picks[0] = largest.model_copy(
+                update={
+                    "est_value": adjusted,
+                    "qty": round(adjusted / largest.price, 4),
+                    "weight": round(adjusted / amount, 4),
+                }
+            )
+
+        invested = round(sum(p.est_value for p in picks), 2)
+        split = ", ".join(
+            f"${p.est_value:,.0f} into {p.symbol} ({p.weight * 100:.0f}%)" for p in picks
+        )
+        note = (
+            f"Split ${invested:,.2f} of ${amount:,.2f} across {len(picks)} position(s): "
+            f"{split}. Dollar amounts, so this needs a broker that sells "
+            "fractional shares — Wealthsimple and Questrade both do. Accepting "
+            "adds these to your trade checklist — nothing is placed until you "
+            "approve each one."
+        )
+        return DeployPlanOut(
+            amount=round(amount, 2),
+            sizing="dollars",
+            picks=picks,
+            passed=self._trim_passed(passed),
+            invested=invested,
+            cash_remaining=round(amount - invested, 2),
+            considered=considered,
+            source=source,
+            note=note,
+        )
+
     @staticmethod
+    def _allocate(
+        amount: float, targets: dict[str, float], prices: dict[str, float]
+    ) -> dict[str, int]:
+        """Turn conviction weights into whole-share counts.
+
+        Three passes, and the order between the first two is the whole trick:
+
+          1. seed one share of each name that deserves a place, dearest first;
+          2. bulk-fill each name up to its conviction slice;
+          3. sweep what rounding left behind into whoever is furthest below
+             target.
+
+        Seeding has to come first because a cheap name will otherwise eat the
+        budget a dear one needed — allocate $1,000 proportionally across a $10
+        stock and a $600 stock and the $10 side takes its $500 slice, leaving
+        $400 against a $600 share that then never gets bought.
+
+        Pass 3 is what makes small amounts work at all: at $500 across four
+        names no single slice covers a $200 share, so flooring alone returns
+        nothing and leaves the whole amount in cash — which is what this engine
+        used to do.
+        """
+        qty = {symbol: 0 for symbol in targets}
+
+        # A name whose single share costs more than the whole amount can't take
+        # part at all. Drop it and renormalise, so its conviction funds the
+        # names that can rather than sitting the difference out in cash.
+        usable = {s: w for s, w in targets.items() if prices[s] <= amount}
+        if not usable:
+            return qty
+        total_weight = sum(usable.values()) or 1.0
+        weights = {s: w / total_weight for s, w in usable.items()}
+        dearest_first = sorted(weights, key=lambda s: prices[s], reverse=True)
+        spent = 0.0
+
+        # 1. A share each, for names whose price is close enough to their slice
+        #    to have earned it.
+        for symbol in dearest_first:
+            price = prices[symbol]
+            if price > amount - spent:
+                continue
+            if price > weights[symbol] * amount * SEED_TOLERANCE:
+                continue
+            qty[symbol] = 1
+            spent += price
+
+        # 2. Up to each name's conviction slice, still dearest first.
+        for symbol in dearest_first:
+            price = prices[symbol]
+            wanted = int((weights[symbol] * amount) // price) - qty[symbol]
+            add = max(0, min(wanted, int((amount - spent) // price)))
+            qty[symbol] += add
+            spent += add * price
+
+        # 3. The remainder.
+        for _ in range(MAX_SWEEP_STEPS):
+            leftover = amount - spent
+            best: str | None = None
+            best_deficit = 0.0
+            for symbol, weight in weights.items():
+                price = prices[symbol]
+                if price > leftover:
+                    continue
+                # A name may overshoot its target to use up cash, but not past
+                # the concentration cap. Its own target always wins over the
+                # cap, so a one- or two-name split is never blocked by it.
+                cap = max(CONCENTRATION_CAP, weight) * amount
+                if (qty[symbol] + 1) * price > cap:
+                    continue
+                deficit = weight * amount - qty[symbol] * price
+                if best is None or deficit > best_deficit:
+                    best, best_deficit = symbol, deficit
+            if best is None:
+                break  # nothing affordable still under its cap — rest stays cash
+            qty[best] += 1
+            spent += prices[best]
+        return qty
+
+    @staticmethod
+    def _trim_passed(passed: list[DeployPassedOut]) -> list[DeployPassedOut]:
+        """Committee verdicts first, low-ranked also-rans last, then cap it.
+
+        A wide scan produces far more also-rans than anyone wants to read, and
+        `considered` already reports how many were looked at.
+        """
+        ordered = sorted(passed, key=lambda p: _PASSED_PRIORITY.get(p.action, 2))
+        return ordered[:MAX_PASSED_REPORTED]
+
+    @classmethod
     def _empty_plan(
+        cls,
         amount: float,
         passed: list[DeployPassedOut],
         considered: int,
         source: str,
         note: str,
+        sizing: Sizing = "shares",
     ) -> DeployPlanOut:
         return DeployPlanOut(
             amount=round(amount, 2),
+            sizing=sizing,
             picks=[],
-            passed=passed,
+            passed=cls._trim_passed(passed),
             invested=0.0,
             cash_remaining=round(amount, 2),
             considered=considered,
@@ -341,6 +682,10 @@ class DeployService:
         await self.proposals.expire_open_proposals(user_id)
         batch_id = uuid.uuid4()
 
+        # Dollar-sized orders carry the amount and no quantity: the amount is
+        # what the user decided, and the share count it implies moves with the
+        # price between now and the fill.
+        dollars = body.sizing == "dollars"
         orders = [
             ProposedOrder(
                 user_id=user_id,
@@ -349,13 +694,18 @@ class DeployService:
                 symbol=o.symbol.strip().upper(),
                 side=OrderSide.BUY,
                 order_type="market",
-                qty=float(o.qty),
-                notional_cents=None,
+                qty=None if dollars else float(o.qty),
+                notional_cents=round(o.qty * o.price * 100) if dollars else None,
                 est_value_cents=round(o.qty * o.price * 100),
                 reason=(
                     o.reason.strip()
-                    or f"Buy {o.qty} share(s) of {o.symbol.upper()} "
-                    f"≈ ${o.qty * o.price:,.2f} CAD from your cash plan."
+                    or (
+                        f"Put ${o.qty * o.price:,.2f} CAD into {o.symbol.upper()} "
+                        "from your cash plan."
+                        if dollars
+                        else f"Buy {o.qty:g} share(s) of {o.symbol.upper()} "
+                        f"≈ ${o.qty * o.price:,.2f} CAD from your cash plan."
+                    )
                 ),
             )
             for o in body.orders

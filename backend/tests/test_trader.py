@@ -99,8 +99,10 @@ async def test_autotrader_is_safe_by_default(seeded_session):
     assert run.executed == 0
     assert all(d.executed is False for d in run.decisions)
 
-    # Even enabled-but-dry-run must not execute.
+    # Enabled-but-dry-run reports without writing to the trade checklist.
     await svc.update_config(user_id, AutoTraderConfigIn(enabled=True, dry_run=True))
     run2 = await svc.run(user_id)
     assert run2.executed == 0
-    assert await PaperBrokerService(seeded_session, FakeProvider()).portfolio(user_id) is not None
+    # The bot works on the real portfolio now and must leave the sandbox alone.
+    paper = await PaperBrokerService(seeded_session, FakeProvider()).portfolio(user_id)
+    assert paper.positions == []

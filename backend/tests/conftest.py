@@ -15,6 +15,8 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from app.ai.factory import get_llm_provider
+from app.ai.llm.openai_compat import reset_quota_breaker
 from app.core.config import settings
 from app.db.base import Base
 from app.db.session import get_session
@@ -26,13 +28,27 @@ TEST_URL = "sqlite+aiosqlite:///:memory:"
 
 @pytest.fixture(autouse=True)
 def _llm_configured(monkeypatch):
-    """Make ``settings.ai_available`` track ``ai_enabled`` alone.
+    """Make ``settings.ai_available`` track ``ai_enabled`` alone, and keep the
+    suite hermetic.
 
     The AI paths are gated on a key being present, so without this every test
     that injects a fake LLM would silently take the fallback branch instead.
     Nothing reaches the network — the key is never used by a fake.
+
+    ``llm_fallbacks`` is emptied and the provider cache cleared because both
+    outlive a test: a developer with a real fallback key in their ``.env``
+    would otherwise have the suite build a pool pointed at a live provider, and
+    ``get_llm_provider`` is ``lru_cache``d, so the first test to touch it would
+    fix that pool in place for every test after it. The quota breaker is module
+    state for the same reason.
     """
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_fallbacks", [])
+    get_llm_provider.cache_clear()
+    reset_quota_breaker()
+    yield
+    get_llm_provider.cache_clear()
+    reset_quota_breaker()
 
 
 @pytest_asyncio.fixture

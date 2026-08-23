@@ -77,6 +77,12 @@ class BrokerageConnectionRepository:
         row.status = status
         await self.session.flush()
 
+    async def delete(self, row: BrokerageConnection) -> None:
+        """Remove one connection — an account closed or de-authorized at the
+        broker. Unlinking everything is a separate, user-initiated action."""
+        await self.session.delete(row)
+        await self.session.flush()
+
     async def delete_all_for_user(self, user_id: uuid.UUID) -> int:
         result = await self.session.execute(
             delete(BrokerageConnection).where(BrokerageConnection.user_id == user_id)

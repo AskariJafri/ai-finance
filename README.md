@@ -69,13 +69,36 @@ LLM_API_KEY=sk-or-...            # in .env
 Leave it blank and the app still runs — every AI feature falls back to its
 rules-based answer rather than failing.
 
-`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` are the whole configuration, and
-the client is plain OpenAI-compatible HTTP, so Groq, Cerebras or the Hugging
+`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` configure the preferred endpoint,
+and the client is plain OpenAI-compatible HTTP, so Groq, Cerebras or the Hugging
 Face router work by changing those three values.
 
 **Free-model quota:** 20 requests/minute and 50/day (1,000/day once you've
 bought $10 of credits at any point). Costs are one request per chat message, per
-advice generation, and per committee ticker.
+advice generation, and per committee ticker — so a single portfolio plan, which
+deliberates once per holding and once per candidate, can spend ten of the fifty.
+
+**`LLM_FALLBACKS`** holds an ordered list of further endpoints, tried when the
+preferred one cannot answer:
+
+```bash
+LLM_FALLBACKS=[{"base_url":"https://api.groq.com/openai/v1","model":"openai/gpt-oss-120b",
+                "api_key":"gsk_...","max_tokens":2000,"max_concurrency":2,
+                "extra_body":{"reasoning_effort":"low"}}]
+```
+
+Each free tier is metered on its own key, so every entry is another allowance.
+`max_tokens`, `max_concurrency` and `extra_body` are per-endpoint because rate
+limits are: Groq allows 1,000 requests a day but only 8,000 tokens a minute, and
+reserves `max_tokens` against that — so the global defaults never fit, and
+`reasoning_effort` (which gpt-oss honours) more than halves what a committee
+verdict costs. Check your key's own `/models` list before picking one; model
+availability differs per account.
+The order is preference order — the primary answers whenever it can, and a
+provider that reports its daily quota spent is skipped for the rest of the day
+rather than being retried on every call. With no fallbacks configured nothing
+changes; with none of them reachable, every feature still degrades to its
+rules-based answer as before.
 
 ## Backend — local dev
 

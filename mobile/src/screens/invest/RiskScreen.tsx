@@ -62,7 +62,8 @@ export function RiskScreen() {
       ) : !data || data.reason ? (
         <View style={styles.center}>
           <Text style={{ color: theme.colors.textMuted, textAlign: "center", padding: 24 }}>
-            {data?.reason ?? "Connect Alpaca and run a sync to see risk metrics."}
+            {data?.reason ??
+        "Add holdings — or sync your linked brokerage — to see risk metrics."}
           </Text>
         </View>
       ) : (

@@ -45,3 +45,6 @@ class BrokerageSyncOut(BaseModel):
     positions_synced: int
     positions_removed: int
     cash_cents: int
+    # Accounts the broker could not be reached for. The sync still succeeds for
+    # every other account, so this is reported rather than raised.
+    failed_accounts: list[str] = []

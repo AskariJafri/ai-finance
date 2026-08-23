@@ -8,6 +8,7 @@ so Canadian listings ("VFV.TO") work alongside US ones ("SPY").
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date as date_type
 from datetime import timedelta
 
@@ -28,6 +29,10 @@ BENCHMARK = "SPY"
 FX_SYMBOL = "USDCAD=X"  # Yahoo's USD/CAD ticker
 HISTORY_START = date_type(2010, 1, 1)
 
+# Upstream fetches run concurrently; the DB writes that follow do not (see
+# `sync_bars`). Kept modest so a wide scan doesn't look like a scraper to Yahoo.
+MAX_CONCURRENT_FETCHES = 8
+
 
 class MarketDataService:
     def __init__(self, session: AsyncSession, provider: MarketDataProvider) -> None:
@@ -35,37 +40,88 @@ class MarketDataService:
         self.provider = provider
         self.bars = PriceBarRepository(session)
 
-    async def sync_bars(self, symbols: list[str]) -> tuple[int, int, list[str]]:
+    async def sync_bars(
+        self, symbols: list[str], since: date_type | None = None
+    ) -> tuple[int, int, list[str]]:
         """Fetch missing daily bars for symbols + benchmark + FX.
+
+        `since` is how far back the caller needs history. It defaults to
+        `HISTORY_START` (what backtests and Monte Carlo want). The cash-deploy
+        scanner passes a much shorter window instead: it ranks a universe far
+        wider than any one portfolio, and pulling fifteen years for every
+        candidate would cost more than the scan is worth.
+
+        Fetches run concurrently, writes do not — an `AsyncSession` is not safe
+        for concurrent use, so the network phase fans out and the upsert phase
+        stays sequential.
 
         Returns (symbols_updated, bars_added, failed_symbols). A bad ticker
         never fails the whole sync — it is reported back to the user.
         """
         today = date_type.today()
+        want_start = since or HISTORY_START
         wanted = sorted({s.upper() for s in symbols} | {BENCHMARK, FX_SYMBOL})
-        symbols_updated = 0
-        bars_added = 0
-        failed: list[str] = []
 
+        jobs: list[tuple[str, date_type, date_type]] = []
         for symbol in wanted:
-            latest = await self.bars.latest_date(symbol)
-            start = (latest + timedelta(days=1)) if latest else HISTORY_START
-            if start > today:
-                continue
-            try:
-                points = await self.provider.get_bars(symbol, start, today)
-            except MarketDataError as exc:
-                logger.warning("Bar fetch failed for %s: %s", symbol, exc)
-                failed.append(symbol)
+            jobs.extend(await self._missing_ranges(symbol, want_start, today))
+        if not jobs:
+            return 0, 0, []
+
+        limiter = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+
+        async def fetch(
+            symbol: str, start: date_type, end: date_type
+        ) -> tuple[str, list[tuple[date_type, float]], bool]:
+            async with limiter:
+                try:
+                    points = await self.provider.get_bars(symbol, start, end)
+                except MarketDataError as exc:
+                    logger.warning("Bar fetch failed for %s: %s", symbol, exc)
+                    return symbol, [], True
+                return symbol, [(p.date, p.close) for p in points], False
+
+        fetched = await asyncio.gather(*(fetch(*job) for job in jobs))
+
+        updated: set[str] = set()
+        failed: list[str] = []
+        bars_added = 0
+        for symbol, points, error in fetched:
+            if error:
+                if symbol not in failed:
+                    failed.append(symbol)
                 continue
             if not points:
                 continue
-            added = await self.bars.bulk_upsert(symbol, [(p.date, p.close) for p in points])
+            added = await self.bars.bulk_upsert(symbol, points)
             if added:
-                symbols_updated += 1
+                updated.add(symbol)
                 bars_added += added
 
-        return symbols_updated, bars_added, failed
+        return len(updated), bars_added, failed
+
+    async def _missing_ranges(
+        self, symbol: str, want_start: date_type, today: date_type
+    ) -> list[tuple[str, date_type, date_type]]:
+        """Date ranges we don't already have cached for `symbol`.
+
+        Both ends matter. Forward-filling alone was enough while every caller
+        started at `HISTORY_START`; now that a caller may ask for a short
+        window, a symbol first cached by that caller would otherwise be stuck
+        with a truncated history no later backtest could repair — so an earlier
+        `want_start` backfills.
+        """
+        earliest = await self.bars.earliest_date(symbol)
+        latest = await self.bars.latest_date(symbol)
+        if earliest is None or latest is None:
+            return [(symbol, want_start, today)] if want_start <= today else []
+
+        ranges: list[tuple[str, date_type, date_type]] = []
+        if want_start < earliest:
+            ranges.append((symbol, want_start, earliest - timedelta(days=1)))
+        if latest < today:
+            ranges.append((symbol, latest + timedelta(days=1), today))
+        return ranges
 
     async def lookup(self, symbol: str) -> SymbolQuote:
         """Validate a ticker and get its live price + currency (for holdings)."""

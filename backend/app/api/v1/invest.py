@@ -172,7 +172,7 @@ async def set_targets(
 async def propose_rebalance(
     body: RebalanceIn, user: CurrentUser, service: InvestServiceDep
 ) -> ProposalOut:
-    return await service.propose_rebalance(user.id, body.drift_threshold)
+    return await service.propose_rebalance(user.id, body.drift_threshold, body.sizing)
 
 
 @router.get("/orders/proposed", response_model=list[ProposedOrderOut])

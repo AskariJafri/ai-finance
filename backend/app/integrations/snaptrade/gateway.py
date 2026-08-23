@@ -48,6 +48,10 @@ class SnapTradeAccount:
     currency: str
     total_value_cents: int
     cash_cents: int
+    # False once the account is closed at the broker. SnapTrade keeps reporting
+    # a closed account indefinitely, so without this a disabled account is
+    # indistinguishable from a live one and lingers in the app forever.
+    is_open: bool = True
 
 
 @dataclass(frozen=True)

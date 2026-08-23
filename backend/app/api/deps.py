@@ -39,6 +39,7 @@ from app.services.invest_insight_service import InvestInsightService
 from app.services.invest_service import InvestService
 from app.services.paper_broker_service import PaperBrokerService
 from app.services.plaid_service import PlaidService
+from app.services.portfolio_actions_service import PortfolioActionsService
 from app.services.settings_service import SettingsService
 from app.services.transaction_service import TransactionService
 from app.services.watchlist_service import WatchlistService
@@ -109,6 +110,10 @@ def get_deploy_service(session: SessionDep) -> DeployService:
     return DeployService(session, get_market_data_provider(), get_advice_llm_provider())
 
 
+def get_portfolio_actions_service(session: SessionDep) -> PortfolioActionsService:
+    return PortfolioActionsService(session, get_market_data_provider(), get_advice_llm_provider())
+
+
 def get_paper_broker_service(session: SessionDep) -> PaperBrokerService:
     return PaperBrokerService(session, get_market_data_provider())
 
@@ -163,6 +168,9 @@ InvestInsightServiceDep = Annotated[InvestInsightService, Depends(get_invest_ins
 WatchlistServiceDep = Annotated[WatchlistService, Depends(get_watchlist_service)]
 CommitteeServiceDep = Annotated[CommitteeService, Depends(get_committee_service)]
 DeployServiceDep = Annotated[DeployService, Depends(get_deploy_service)]
+PortfolioActionsServiceDep = Annotated[
+    PortfolioActionsService, Depends(get_portfolio_actions_service)
+]
 PaperBrokerServiceDep = Annotated[PaperBrokerService, Depends(get_paper_broker_service)]
 AutoTraderServiceDep = Annotated[AutoTraderService, Depends(get_autotrader_service)]
 BrokerageServiceDep = Annotated[BrokerageService, Depends(get_brokerage_service)]

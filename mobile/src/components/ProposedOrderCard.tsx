@@ -41,6 +41,8 @@ export function ProposedOrderCard({
   const [price, setPrice] = useState("");
   const isBuy = order.side === "buy";
   const open = order.status === "proposed";
+  // A notional order carries no share quantity, and SnapTrade cannot route
+  // one — so dollar-sized orders stay manual even with live trading on.
   const live = canTrade && onApprove != null && order.qty != null;
   const pending = order.status === "submitted";
 
@@ -68,6 +70,12 @@ export function ProposedOrderCard({
       {order.qty != null ? (
         <Text style={[styles.qty, { color: theme.colors.text }]}>
           {order.qty} share{order.qty === 1 ? "" : "s"}
+        </Text>
+      ) : order.notional != null ? (
+        // Dollar-sized: the amount is the instruction, and the share count it
+        // buys is whatever the price is when you place it.
+        <Text style={[styles.qty, { color: theme.colors.text }]}>
+          {formatCurrency(order.notional)} of {order.symbol}
         </Text>
       ) : null}
       <Text style={[styles.reason, { color: theme.colors.textMuted }]}>{order.reason}</Text>

@@ -10,9 +10,13 @@ from app.api.deps import (
     CurrentUser,
     DeployServiceDep,
     PaperBrokerServiceDep,
+    PortfolioActionsServiceDep,
 )
 from app.schemas.committee import AnalyzeIn, CommitteeResult, SessionSummary
 from app.schemas.invest import (
+    ActionAcceptIn,
+    ActionPlanIn,
+    ActionPlanOut,
     DeployAcceptIn,
     DeployPlanIn,
     DeployPlanOut,
@@ -63,6 +67,25 @@ async def propose_deploy(
 async def accept_deploy(
     body: DeployAcceptIn, user: CurrentUser, service: DeployServiceDep
 ) -> ProposalOut:
+    return await service.accept(user.id, body)
+
+
+# --- AI portfolio actions (sell + buy over what you already own) ---
+@router.post("/actions/propose", response_model=ActionPlanOut)
+async def propose_actions(
+    body: ActionPlanIn, user: CurrentUser, service: PortfolioActionsServiceDep
+) -> ActionPlanOut:
+    """Slow — one committee deliberation per held position and per shortlisted
+    candidate. Read-only: persists nothing and can never place a trade."""
+    return await service.plan(user.id, body)
+
+
+@router.post("/actions/accept", response_model=ProposalOut)
+async def accept_actions(
+    body: ActionAcceptIn, user: CurrentUser, service: PortfolioActionsServiceDep
+) -> ProposalOut:
+    """Write the plan to the trade checklist as PROPOSED orders. Each still
+    needs its own approval before anything reaches a broker."""
     return await service.accept(user.id, body)
 
 

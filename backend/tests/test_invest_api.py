@@ -223,3 +223,201 @@ async def test_targets_validation(client: AsyncClient):
         json=[{"symbol": "VFV.TO", "weight": 0.5}, {"symbol": "AAPL", "weight": 0.4}],
     )
     assert bad.status_code == 422  # must sum to 100%
+
+
+@pytest.mark.asyncio
+async def test_a_fractional_position_is_never_silently_dropped(client: AsyncClient):
+    """A sub-one-share holding must appear in the plan, not vanish from it.
+
+    Fractional shares are normal at Wealthsimple, and whole-share sizing rounds
+    them to zero. Skipping on that quietly means a position you own is missing
+    from every rebalance with no explanation — which reads as "nothing to do
+    here" rather than "this tool can't express it".
+    """
+    headers = await _register(client, "frac@test.com")
+
+    # 0.68 shares — exactly the shape a fractional-share broker produces.
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "AAPL", "qty": 0.68, "avg_cost": 200.0},
+    )
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "VFV.TO", "qty": 10, "avg_cost": 100.0},
+    )
+    # AAPL has no target at all, so the whole position should be sold.
+    await client.put(
+        f"{PREFIX}/invest/targets",
+        headers=headers,
+        json=[{"symbol": "VFV.TO", "weight": 1.0}],
+    )
+
+    dollars = await client.post(
+        f"{PREFIX}/invest/rebalance/propose",
+        headers=headers,
+        json={"drift_threshold": 0.01, "sizing": "dollars"},
+    )
+    assert dollars.status_code == 200, dollars.text
+    assert any(o["symbol"] == "AAPL" for o in dollars.json()["orders"])
+
+    shares = await client.post(
+        f"{PREFIX}/invest/rebalance/propose",
+        headers=headers,
+        json={"drift_threshold": 0.01, "sizing": "shares"},
+    )
+    assert shares.status_code == 200, shares.text
+    body = shares.json()
+    sell = next((o for o in body["orders"] if o["symbol"] == "AAPL"), None)
+    # Selling a fractional position out entirely is a real order — a broker that
+    # sold you 0.68 of a share will buy it back.
+    assert sell is not None, "the fractional holding disappeared from the plan"
+    assert sell["side"] == "sell"
+    assert sell["qty"] == pytest.approx(0.68)
+    assert sell["est_value"] > 0
+
+
+@pytest.mark.asyncio
+async def test_a_partial_sale_that_cannot_be_whole_shares_is_explained(client: AsyncClient):
+    """When whole shares genuinely can't express a trade, say which and why."""
+    headers = await _register(client, "frac2@test.com")
+
+    # Trimming part of a fractional position is not expressible in whole shares.
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "AAPL", "qty": 0.9, "avg_cost": 200.0},
+    )
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "VFV.TO", "qty": 10, "avg_cost": 100.0},
+    )
+    await client.put(
+        f"{PREFIX}/invest/targets",
+        headers=headers,
+        json=[{"symbol": "AAPL", "weight": 0.05}, {"symbol": "VFV.TO", "weight": 0.95}],
+    )
+
+    resp = await client.post(
+        f"{PREFIX}/invest/rebalance/propose",
+        headers=headers,
+        json={"drift_threshold": 0.01, "sizing": "shares"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if not any(o["symbol"] == "AAPL" for o in body["orders"]):
+        assert "AAPL" in body["note"]
+        assert "dollar amounts" in body["note"].lower()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_target_is_a_valid_answer(client: AsyncClient):
+    """ "Keep none of this" has to be expressible.
+
+    Rejecting a 0% weight forces the holding to be left out of the target set
+    instead — and a holding with no target row silently disappears from the
+    editor, which is how a position ends up marked for full liquidation without
+    anyone choosing that.
+    """
+    headers = await _register(client, "zerotarget@test.com")
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "AAPL", "qty": 5, "avg_cost": 200.0},
+    )
+
+    resp = await client.put(
+        f"{PREFIX}/invest/targets",
+        headers=headers,
+        json=[{"symbol": "AAPL", "weight": 0.0}, {"symbol": "VFV.TO", "weight": 1.0}],
+    )
+    assert resp.status_code == 200, resp.text
+    saved = {t["symbol"]: t["weight"] for t in resp.json()["targets"]}
+    assert saved["AAPL"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_trade_conserves_the_account_total(client: AsyncClient):
+    """A trade is an exchange, not a deletion.
+
+    Selling converts shares into cash and buying does the reverse. Moving only
+    the shares makes every executed sell destroy its own proceeds, so the
+    account total silently drops by the size of each trade — which is exactly
+    what a user notices when the app disagrees with their broker.
+    """
+    headers = await _register(client, "conserve@test.com")
+    for symbol in ("VFV.TO", "XEQT.TO"):
+        await client.put(
+            f"{PREFIX}/invest/holdings",
+            headers=headers,
+            json={"symbol": symbol, "qty": 10, "avg_cost": 100.0},
+        )
+    await client.put(f"{PREFIX}/invest/cash", headers=headers, json={"cash": 500})
+    # XEQT has no target, so the rebalancer proposes selling all of it.
+    await client.put(
+        f"{PREFIX}/invest/targets", headers=headers, json=[{"symbol": "VFV.TO", "weight": 1.0}]
+    )
+
+    before = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
+    equity_before = before["account"]["equity"]
+    price = next(p["price"] for p in before["positions"] if p["symbol"] == "XEQT.TO")
+
+    proposal = await client.post(
+        f"{PREFIX}/invest/rebalance/propose",
+        headers=headers,
+        json={"drift_threshold": 0.01, "sizing": "shares"},
+    )
+    # Fill at the price the portfolio is valued at, so only the accounting can
+    # move the total.
+    sells = [o for o in proposal.json()["orders"] if o["side"] == "sell"]
+    assert sells, "expected a sell for the untargeted holding"
+    order = sells[0]
+
+    resp = await client.post(
+        f"{PREFIX}/invest/orders/proposed/{order['id']}/executed",
+        headers=headers,
+        json={"fill_price": price},
+    )
+    assert resp.status_code == 200, resp.text
+
+    after = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
+    assert after["account"]["equity"] == pytest.approx(equity_before, abs=0.05)
+    assert after["account"]["cash"] > before["account"]["cash"]
+
+
+@pytest.mark.asyncio
+async def test_a_bought_position_is_paid_for_out_of_cash(client: AsyncClient):
+    headers = await _register(client, "paidfor@test.com")
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "VFV.TO", "qty": 10, "avg_cost": 100.0},
+    )
+    await client.put(f"{PREFIX}/invest/cash", headers=headers, json={"cash": 5000})
+
+    before = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
+    price = next(p["price"] for p in before["positions"] if p["symbol"] == "VFV.TO")
+
+    plan = await client.post(
+        f"{PREFIX}/invest/deploy/accept",
+        headers=headers,
+        json={
+            "orders": [{"symbol": "VFV.TO", "qty": 2, "price": price, "reason": "test"}],
+            "sizing": "shares",
+        },
+    )
+    assert plan.status_code == 200, plan.text
+    order = plan.json()["orders"][0]
+
+    resp = await client.post(
+        f"{PREFIX}/invest/orders/proposed/{order['id']}/executed",
+        headers=headers,
+        json={"fill_price": price},
+    )
+    assert resp.status_code == 200, resp.text
+
+    after = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
+    assert after["account"]["cash"] < before["account"]["cash"]
+    assert after["account"]["equity"] == pytest.approx(before["account"]["equity"], abs=0.05)

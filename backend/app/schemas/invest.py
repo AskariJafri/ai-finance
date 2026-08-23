@@ -290,7 +290,10 @@ class ScenarioOut(BaseModel):
 # --- targets + rebalance checklist ---
 class TargetIn(BaseModel):
     symbol: str = Field(min_length=1, max_length=16)
-    weight: float = Field(gt=0, le=1)
+    # Zero is a real answer: "I hold this and I want none of it." Rejecting it
+    # forced a held position to be omitted from the targets instead, which then
+    # dropped it off the editor entirely — the same silence, harder to spot.
+    weight: float = Field(ge=0, le=1)
 
 
 class TargetsOut(BaseModel):
@@ -304,6 +307,10 @@ class ProposedOrderOut(BaseModel):
     symbol: str
     side: str
     qty: float | None = None
+    # Dollar-sized orders carry an amount instead of a quantity. Exactly one of
+    # `qty` / `notional` is set, and which one decides how the app phrases the
+    # instruction: "buy 4 shares" or "put $120 in".
+    notional: float | None = None
     est_value: float  # CAD
     reason: str
     status: str
@@ -323,8 +330,17 @@ class ProposalOut(BaseModel):
     disclaimer: str = INVEST_DISCLAIMER
 
 
+# How an order is sized. "shares" is whole shares — the only thing a broker can
+# be handed through SnapTrade. "dollars" is a notional amount, which is how a
+# fractional-share broker (Wealthsimple, Questrade) actually lets you buy, and
+# the only sizing that works at all on an account too small for one share of
+# what it wants. Notional orders cannot be routed, so they stay advisory.
+Sizing = Literal["shares", "dollars"]
+
+
 class RebalanceIn(BaseModel):
     drift_threshold: float = Field(default=0.05, ge=0.005, le=0.5)
+    sizing: Sizing = "shares"
 
 
 class MarkExecutedIn(BaseModel):
@@ -335,16 +351,23 @@ class MarkExecutedIn(BaseModel):
 # --- deploy cash ("I have $X to invest") ---
 class DeployPlanIn(BaseModel):
     amount: float = Field(gt=0, le=10_000_000)
-    # Only the top-ranked survivors face the committee — each one costs six LLM
-    # calls, so this is the knob that bounds how long the request takes.
-    max_candidates: int = Field(default=4, ge=1, le=6)
+    # The whole universe is ranked for free on cached bars; only the top-ranked
+    # survivors face the committee, and each one costs an LLM call. So this is
+    # the knob that bounds both request latency and metered daily quota.
+    max_candidates: int = Field(default=6, ge=1, le=12)
+    # How many names the amount may be split across. Capped at the 10 that
+    # `DeployAcceptIn` will accept as orders.
+    max_positions: int = Field(default=5, ge=1, le=10)
     use_ai: bool = True
+    sizing: Sizing = "shares"
 
 
 class DeployPickOut(BaseModel):
     symbol: str
     name: str | None = None
-    qty: int  # whole shares only — fractional orders can't be routed to a broker
+    # Whole under "shares" sizing, fractional under "dollars" — in the latter
+    # the amount is what was decided and the quantity is derived from it.
+    qty: float
     price: float  # CAD per share
     est_value: float  # CAD
     weight: float  # share of `amount` this pick was allocated
@@ -364,6 +387,7 @@ class DeployPassedOut(BaseModel):
 
 class DeployPlanOut(BaseModel):
     amount: float
+    sizing: Sizing = "shares"
     picks: list[DeployPickOut]
     passed: list[DeployPassedOut]
     invested: float
@@ -376,13 +400,84 @@ class DeployPlanOut(BaseModel):
 
 class DeployOrderIn(BaseModel):
     symbol: str = Field(min_length=1, max_length=16)
-    qty: int = Field(gt=0, le=1_000_000)
+    qty: float = Field(gt=0, le=1_000_000)
     price: float = Field(gt=0, le=1_000_000)
     reason: str = Field(default="", max_length=500)
 
 
 class DeployAcceptIn(BaseModel):
     orders: list[DeployOrderIn] = Field(min_length=1, max_length=10)
+    sizing: Sizing = "shares"
+
+
+# --- AI portfolio actions ("what should I buy or sell?") ---
+class ActionPlanIn(BaseModel):
+    # Extra cash to put to work on top of the cash the app already tracks for
+    # this account. Defaults to none — the plan spends what is already there.
+    added_cash: float = Field(default=0.0, ge=0, le=10_000_000)
+    # New names to open, on top of decisions about what is already held. Held
+    # positions are always judged; this only bounds the shopping list.
+    max_new_positions: int = Field(default=3, ge=0, le=6)
+    # Committee calls are metered per day, so this bounds the shortlist of
+    # unheld candidates that get one. Held positions each cost one too.
+    max_candidates: int = Field(default=5, ge=1, le=10)
+    use_ai: bool = True
+    sizing: Sizing = "dollars"
+
+
+class ActionOut(BaseModel):
+    symbol: str
+    name: str | None = None
+    side: str  # buy | sell
+    # EXIT and TRIM are sells, ADD tops up something held, NEW opens a position.
+    action: str  # EXIT | TRIM | ADD | NEW
+    amount: float  # CAD
+    qty: float | None = None  # null when the order is sized in dollars
+    price: float  # CAD per share
+    current_weight: float
+    projected_weight: float
+    confidence: float
+    reason: str
+
+
+class ActionHoldOut(BaseModel):
+    """Something held that the committee decided to leave alone — shown so the
+    absence of an order reads as a decision rather than an oversight."""
+
+    symbol: str
+    weight: float
+    confidence: float
+    reason: str
+
+
+class ActionPlanOut(BaseModel):
+    as_of: str
+    currency: str = "CAD"
+    equity: float
+    cash_before: float
+    cash_after: float
+    sizing: Sizing = "dollars"
+    actions: list[ActionOut]
+    holds: list[ActionHoldOut]
+    passed: list[DeployPassedOut]
+    considered: int
+    source: str  # ai | rules
+    note: str
+    disclaimer: str = INVEST_DISCLAIMER
+
+
+class ActionOrderIn(BaseModel):
+    symbol: str = Field(min_length=1, max_length=16)
+    side: Literal["buy", "sell"]
+    amount: float = Field(gt=0, le=10_000_000)  # CAD
+    price: float = Field(gt=0, le=1_000_000)
+    qty: float | None = Field(default=None, gt=0, le=1_000_000)
+    reason: str = Field(default="", max_length=500)
+
+
+class ActionAcceptIn(BaseModel):
+    orders: list[ActionOrderIn] = Field(min_length=1, max_length=20)
+    sizing: Sizing = "dollars"
 
 
 class ExplainerOut(BaseModel):

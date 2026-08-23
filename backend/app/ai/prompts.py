@@ -69,13 +69,34 @@ INVEST_SYSTEM = (
 
 
 def build_invest_health_prompt(figures: dict) -> str:
+    # Every figure below is computed in SQL from market data and normalized to
+    # CAD before it gets here. The model interprets them; it never derives one.
+    source = (
+        "synced from the user's linked brokerage account"
+        if figures.get("from_brokerage")
+        else "entered by the user"
+    )
     lines = [
-        f"Account equity: ${figures.get('equity') or 0:,.2f} USD "
-        f"across {figures.get('n_positions', 0)} positions.",
+        f"Account equity: ${figures.get('equity') or 0:,.2f} CAD "
+        f"across {figures.get('n_positions', 0)} positions ({source}).",
+        f"Cash: ${figures.get('cash') or 0:,.2f} CAD "
+        f"({(figures.get('cash_pct') or 0) * 100:.1f}% of the account).",
+        f"US-dollar exposure: {(figures.get('usd_exposure_pct') or 0) * 100:.0f}% "
+        "of invested value (currency risk for a CAD investor).",
         f"Risk bucket: {figures.get('risk_bucket') or 'unknown'}.",
         f"Risk metrics (1y): {figures.get('risk')}",
         f"Concentration: {figures.get('concentration')}",
     ]
+    positions = figures.get("positions") or []
+    if positions:
+        lines.append("Positions, largest first:")
+        for p in positions:
+            lines.append(
+                f"  - {p['symbol']}: {p['weight'] * 100:.1f}% of the portfolio, "
+                f"${p['market_value']:,.2f} CAD, "
+                f"unrealized {p['unrealized_pl_pct'] * 100:+.1f}%, "
+                f"priced in {p['currency']}"
+            )
     if figures.get("has_targets"):
         drifts = figures.get("drifted_positions") or []
         if drifts:
@@ -85,9 +106,12 @@ def build_invest_health_prompt(figures: dict) -> str:
     else:
         lines.append("The user has not set target weights yet (no drift analysis possible).")
     lines.append(
-        "\nGive the user a portfolio health check: what the risk level means, "
-        "whether concentration is a concern, what the drift (if any) suggests "
-        "doing, and one habit to improve."
+        "\nGive the user a portfolio review: what the risk level means for an "
+        "account this size, whether concentration or currency exposure is a "
+        "concern, which specific holdings look worth trimming or adding to and "
+        "why, what the drift (if any) suggests doing, and one habit to improve. "
+        "Name the tickers you are talking about. Every number you use must come "
+        "from the figures above — do not estimate, forecast or invent any."
     )
     return "\n".join(lines)
 

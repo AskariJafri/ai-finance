@@ -17,14 +17,12 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { SpendDonut } from "../components/SpendDonut";
 import { TransactionRow } from "../components/TransactionRow";
-import { useSession } from "../stores/session";
 import { useTheme } from "../theme";
 import { formatCurrency, formatPercent } from "../utils/format";
 
 export function DashboardScreen() {
   const theme = useTheme();
   const navigation = useNavigation<any>();
-  const signOut = useSession((s) => s.signOut);
   const { data, isLoading, isError, refetch, isRefetching } = useDashboard();
   const sync = useSync();
 
@@ -40,8 +38,15 @@ export function DashboardScreen() {
               {sync.isPending ? "Syncing…" : "Sync"}
             </Text>
           </Pressable>
-          <Pressable onPress={() => signOut()} hitSlop={8}>
-            <Text style={[styles.action, { color: theme.colors.textMuted }]}>Sign out</Text>
+          {/* Settings lost its tab to keep the bar at five. Sign out lives
+              inside it, where it already was — this replaces a duplicate. */}
+          <Pressable
+            onPress={() => navigation.navigate("Settings")}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+          >
+            <Text style={{ color: theme.colors.textMuted, fontSize: 20 }}>⚙</Text>
           </Pressable>
         </View>
       </View>

@@ -7,12 +7,49 @@ testable (override via env) and documents every knob in one place.
 
 from __future__ import annotations
 
+import json
+import logging
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+class LLMEndpoint(BaseModel):
+    """One OpenAI-compatible provider in the failover pool.
+
+    Free tiers are metered per API key, so holding several is the difference
+    between a feature that works all day and one that stops after the fiftieth
+    request. Every field is per-endpoint because a fallback is usually a
+    different host, a different model and a different key all at once.
+    """
+
+    base_url: str
+    model: str
+    api_key: str = ""
+    # Shown in logs when the pool moves past this endpoint; defaults to the host.
+    label: str = ""
+    # Both default to the global settings when unset. They are per-endpoint
+    # because rate limits are: Groq's free tier allows 1,000 requests a day but
+    # only 8,000 tokens a minute, and it reserves `max_tokens` against that
+    # budget — so six concurrent calls of 3,500 blow the minute limit before the
+    # daily one is touched. Sizing the whole pool by its most restrictive member
+    # would throttle the others for no reason.
+    max_tokens: int | None = None
+    max_concurrency: int | None = None
+    # Extra body fields for this endpoint, merged into every request. Provider
+    # quirks belong in configuration rather than in the client: Groq's gpt-oss
+    # models take `reasoning_effort`, and on a token-per-minute budget that one
+    # field is the difference between a plan that fits and one that does not —
+    # a committee verdict costs 2,146 tokens at the default effort and 929 at
+    # "low", for the same five seats and the same decision.
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    def display(self) -> str:
+        return self.label or self.base_url
+
 
 # Shipped placeholders. Usable locally, refused anywhere else — see
 # ``_reject_default_secrets``.
@@ -88,12 +125,28 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 45.0
     # Free tiers cap requests per minute; the committee fans out over tickers
     # concurrently, so in-flight calls are capped process-wide.
-    llm_max_concurrency: int = 4
-    llm_max_tokens: int = 900
+    # The committee fans out one call per ticker, so this sets how long a plan
+    # takes: ten calls at four at a time is three waves. The free tier allows 20
+    # requests a minute, so six is still well inside the rate limit while
+    # cutting a wave off the wall time.
+    llm_max_concurrency: int = 6
+    # Generous because reasoning models charge their private scratchpad
+    # against this budget; too low and the answer is truncated before it
+    # begins. Answers themselves are a few hundred tokens — but the committee
+    # emits five seats plus a verdict as JSON, which is the longest thing the
+    # app asks for and the reason this is not tighter.
+    llm_max_tokens: int = 3500
     llm_json_mode: bool = True
     # Sent as HTTP-Referer / X-Title; OpenRouter uses them to attribute usage.
     llm_app_url: str = ""
     llm_app_title: str = "AI Personal Finance"
+    # Tried in order when the primary above cannot answer — spent quota, an
+    # outage, a truncated reply. Preference order, not round-robin: the first
+    # entry answers whenever it can, so quality stays predictable. Supplied as
+    # JSON, e.g.
+    #   LLM_FALLBACKS=[{"base_url":"https://api.groq.com/openai/v1",
+    #                   "model":"llama-3.3-70b-versatile","api_key":"gsk_..."}]
+    llm_fallbacks: Annotated[list[LLMEndpoint], NoDecode] = Field(default_factory=list)
     ai_enabled: bool = True
 
     # --- Invest ---
@@ -161,6 +214,28 @@ class Settings(BaseSettings):
             return False
         return (urlsplit(self.database_url).hostname or "") not in _LOCAL_HOSTS
 
+    @field_validator("llm_fallbacks", mode="before")
+    @classmethod
+    def _parse_llm_fallbacks(cls, value: object) -> object:
+        """Parse the JSON here so a typo costs the fallbacks, not the boot.
+
+        ``NoDecode`` suppresses pydantic-settings' own decode, which raises
+        inside the env source before any validator runs. ``settings`` is built
+        at import, so that exception takes auth, Plaid and the database down
+        with it — over a misconfigured *optional* provider, in an app where
+        every AI path already degrades to rules on its own.
+        """
+        if not value or isinstance(value, list):
+            return value or []
+        try:
+            parsed = json.loads(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).warning(
+                "LLM_FALLBACKS is not valid JSON — running with the primary provider only"
+            )
+            return []
+        return parsed if isinstance(parsed, list) else []
+
     @property
     def ai_available(self) -> bool:
         """AI paths run only when enabled *and* actually configured.
@@ -168,8 +243,14 @@ class Settings(BaseSettings):
         Without this an unconfigured deploy would attempt every LLM call and
         fall back after a wasted round trip, instead of going straight to the
         rules-based answer.
+
+        Any configured endpoint counts. Keying this on the primary key alone
+        would silently disable every AI path on a deploy that runs entirely on
+        a fallback.
         """
-        return self.ai_enabled and bool(self.llm_api_key)
+        if not self.ai_enabled:
+            return False
+        return bool(self.llm_api_key) or any(f.api_key for f in self.llm_fallbacks)
 
     @property
     def plaid_country_code_list(self) -> list[str]:

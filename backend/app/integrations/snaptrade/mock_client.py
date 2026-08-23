@@ -30,6 +30,10 @@ from app.integrations.snaptrade.gateway import (
 )
 
 _ACCOUNT_ID = "mock-ws-tfsa"
+# A second account the user closed at the broker. SnapTrade keeps reporting
+# closed accounts, so the mock reports one too — that is the only way the
+# skip-closed-accounts path gets exercised without hitting the live API.
+_CLOSED_ACCOUNT_ID = "mock-ws-closed-rrsp"
 
 # Deterministic prices in native-currency cents, used for both position
 # valuation and simulated fills.
@@ -92,12 +96,25 @@ class MockSnapTradeClient(SnapTradeGateway):
                 currency="CAD",
                 total_value_cents=positions_value + cash_cents,
                 cash_cents=cash_cents,
-            )
+                is_open=True,
+            ),
+            SnapTradeAccount(
+                account_id=_CLOSED_ACCOUNT_ID,
+                name="RRSP",
+                number_masked="****9876",
+                institution_name="Wealthsimple",
+                currency="CAD",
+                total_value_cents=0,
+                cash_cents=0,
+                is_open=False,
+            ),
         ]
 
     async def list_positions(
         self, *, snaptrade_user_id: str, user_secret: str, account_id: str
     ) -> list[SnapTradePosition]:
+        if account_id == _CLOSED_ACCOUNT_ID:
+            return []
         return _mock_positions()
 
     async def resolve_symbol(

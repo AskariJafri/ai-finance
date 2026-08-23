@@ -38,8 +38,8 @@ export function ScenariosScreen() {
       ) : error || !data ? (
         <View style={styles.center}>
           <Text style={{ color: theme.colors.textMuted, textAlign: "center", padding: 24 }}>
-            Connect Alpaca, hold some positions, and run a sync to stress-test
-            your portfolio.
+            Add holdings — or sync your linked brokerage — to stress-test your
+            portfolio against real crashes.
           </Text>
         </View>
       ) : (

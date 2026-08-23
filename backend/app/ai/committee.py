@@ -2,6 +2,13 @@
 real numbers (a live quote + technical indicators) and a CIO synthesizes a
 verdict: BUY / SKIP / HOLD.
 
+Pass ``held`` and the question changes to TRIM / HOLD / ADD. That is not
+cosmetic: "I would not open this today" is true of most things most of the time,
+so reading a SKIP as a sell recommendation turns the committee into a machine
+that tells you to liquidate. An owned position is judged on whether to keep it,
+with its size and unrealized return in front of the seats and an explicit
+instruction that selling clears a higher bar than declining to buy.
+
 Design rules mirrored from the rest of the app:
 - The LLM never invents figures — every number in the prompts comes from
   `Indicators` / the quote. Agents only *interpret*.
@@ -34,6 +41,22 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 VALID_ACTIONS = {"BUY", "SKIP", "HOLD"}
+
+# A position you already own is a different question, and asking the entry
+# question about it produces a systematic sell bias: "I wouldn't open this
+# today" is true of most things most of the time, while "you should sell what
+# you own" has to clear costs, taxes and the odds of being wrong. So a held
+# position gets its own verdict vocabulary and its own instruction to weigh
+# them.
+VALID_HELD_ACTIONS = {"TRIM", "HOLD", "ADD"}
+
+
+@dataclass(frozen=True)
+class HeldContext:
+    """What the seats need to know about a position that is already owned."""
+
+    weight: float  # share of the portfolio, 0..1
+    unrealized_pct: float  # 0.12 = up 12%
 
 
 @dataclass(frozen=True)
@@ -147,6 +170,23 @@ _COMMITTEE_JSON_RULE = (
     f"Include all {len(ROLES)} agents, once each, in the order listed above."
 )
 
+_HELD_JSON_RULE = _COMMITTEE_JSON_RULE.replace(
+    '"action": "<BUY|SKIP|HOLD>"', '"action": "<TRIM|HOLD|ADD>"'
+)
+
+HELD_SYSTEM = (
+    COMMITTEE_SYSTEM + "\n\nThis position is ALREADY OWNED. You are not deciding whether to open "
+    "it — you are deciding what to do with it now.\n"
+    "- TRIM: the case for reducing or exiting is clear and outweighs the cost of "
+    "being wrong.\n"
+    "- HOLD: keep it as it is. This is the right answer whenever the evidence is "
+    "mixed — 'I would not buy more today' is a HOLD, not a TRIM.\n"
+    "- ADD: the case for putting more money in is clear.\n"
+    "Selling has a higher bar than declining to buy: it realizes the outcome, "
+    "costs the spread, and forfeits the position if you are wrong. Default to "
+    "HOLD when uncertain."
+)
+
 
 def _take(key: str, name: str, data: dict | None) -> AgentTake:
     data = data or {}
@@ -178,17 +218,40 @@ def _takes_from(payload: dict) -> list[AgentTake]:
     return [_take(key, name, by_key.get(key)) for key, name, _ in ROLES]
 
 
-async def run_committee(symbol: str, quote: dict, ind: Indicators, llm: LLMProvider) -> dict:
+async def run_committee(
+    symbol: str,
+    quote: dict,
+    ind: Indicators,
+    llm: LLMProvider,
+    *,
+    held: HeldContext | None = None,
+) -> dict:
+    """Deliberate on one ticker.
+
+    Pass ``held`` when the user already owns it: the seats get the position's
+    size and unrealized return, and the verdict comes back as TRIM/HOLD/ADD
+    rather than BUY/SKIP/HOLD.
+    """
     ctx = _context(symbol, quote, ind)
+    if held is not None:
+        ctx += (
+            f" Currently held: {held.weight * 100:.1f}% of the portfolio, "
+            f"unrealized {held.unrealized_pct * 100:+.1f}%."
+        )
     prompt = (
         f"Deliberate on {symbol} @ {quote.get('price')} {quote.get('currency', '')}.\n"
         f"Data:\n{ctx}\n\n"
         "Give each seat's stance and one-line thesis, then your final decision.\n\n"
-        f"{_COMMITTEE_JSON_RULE}"
+        f"{_HELD_JSON_RULE if held is not None else _COMMITTEE_JSON_RULE}"
     )
 
     try:
-        raw = await llm.complete(prompt, system=COMMITTEE_SYSTEM, temperature=0.3, json_object=True)
+        raw = await llm.complete(
+            prompt,
+            system=HELD_SYSTEM if held is not None else COMMITTEE_SYSTEM,
+            temperature=0.3,
+            json_object=True,
+        )
         payload = _parse_json(raw)
     except Exception as exc:  # noqa: BLE001 — any LLM error degrades to rules
         logger.warning("Committee failed for %s, using rules: %s", symbol, exc)
@@ -197,10 +260,10 @@ async def run_committee(symbol: str, quote: dict, ind: Indicators, llm: LLMProvi
     if not payload:
         # Nothing usable came back at all. Say so honestly rather than showing a
         # table of five seats that never spoke.
-        return rules_only(symbol, quote, ind)
+        return rules_only(symbol, quote, ind, held=held is not None)
 
     takes = _takes_from(payload)
-    verdict = _verdict_from(payload, ind, takes)
+    verdict = _verdict_from(payload, ind, takes, held=held is not None)
     return {
         "symbol": symbol,
         "price": quote.get("price"),
@@ -214,11 +277,13 @@ async def run_committee(symbol: str, quote: dict, ind: Indicators, llm: LLMProvi
     }
 
 
-def _verdict_from(payload: dict, ind: Indicators, takes: list[AgentTake]) -> dict:
+def _verdict_from(
+    payload: dict, ind: Indicators, takes: list[AgentTake], *, held: bool = False
+) -> dict:
     """The CIO's decision, or a transparent rules read when it is unusable."""
     action = str(payload.get("action", "")).upper()
     rationale = str(payload.get("rationale") or "").strip()
-    if action in VALID_ACTIONS and rationale:
+    if action in (VALID_HELD_ACTIONS if held else VALID_ACTIONS) and rationale:
         return {
             "action": action,
             "confidence": round(_clip(payload.get("confidence")), 2),
@@ -227,7 +292,7 @@ def _verdict_from(payload: dict, ind: Indicators, takes: list[AgentTake]) -> dic
         }
     bullish = sum(1 for t in takes if t.stance == "bullish")
     bearish = sum(1 for t in takes if t.stance in ("bearish", "caution"))
-    return _rules_verdict(ind, bullish, bearish)
+    return _rules_verdict(ind, bullish, bearish, held=held)
 
 
 async def run_committee_many(
@@ -235,6 +300,7 @@ async def run_committee_many(
     llm: LLMProvider,
     *,
     use_ai: bool = True,
+    held: dict[str, HeldContext] | None = None,
 ) -> list[dict]:
     """Deliberate over several tickers concurrently.
 
@@ -244,18 +310,21 @@ async def run_committee_many(
     the list short anyway, since free tiers meter requests per day.
     """
 
+    positions = held or {}
+
     async def one(symbol: str, quote: dict, ind: Indicators) -> dict:
+        position = positions.get(symbol)
         if use_ai:
             try:
-                return await run_committee(symbol, quote, ind, llm)
+                return await run_committee(symbol, quote, ind, llm, held=position)
             except Exception as exc:  # noqa: BLE001 — degrade this symbol only
                 logger.warning("Committee failed for %s, using rules: %s", symbol, exc)
-        return rules_only(symbol, quote, ind)
+        return rules_only(symbol, quote, ind, held=position is not None)
 
     return list(await asyncio.gather(*(one(s, q, i) for s, q, i in items)))
 
 
-def rules_only(symbol: str, quote: dict, ind: Indicators) -> dict:
+def rules_only(symbol: str, quote: dict, ind: Indicators, *, held: bool = False) -> dict:
     """Full committee result without any LLM call — used when AI is disabled or
     unreachable, so the feature still works (transparently rules-based)."""
     stance = "bullish" if ind.trend == "up" else "bearish" if ind.trend == "down" else "neutral"
@@ -263,7 +332,12 @@ def rules_only(symbol: str, quote: dict, ind: Indicators) -> dict:
         AgentTake(key, name, stance, 0.5, "AI offline — see the rules-based verdict below.")
         for key, name, _ in ROLES
     ]
-    verdict = _rules_verdict(ind, 1 if stance == "bullish" else 0, 1 if stance == "bearish" else 0)
+    verdict = _rules_verdict(
+        ind,
+        1 if stance == "bullish" else 0,
+        1 if stance == "bearish" else 0,
+        held=held,
+    )
     return {
         "symbol": symbol,
         "price": quote.get("price"),
@@ -277,7 +351,7 @@ def rules_only(symbol: str, quote: dict, ind: Indicators) -> dict:
     }
 
 
-def _rules_verdict(ind: Indicators, bullish: int, bearish: int) -> dict:
+def _rules_verdict(ind: Indicators, bullish: int, bearish: int, *, held: bool = False) -> dict:
     """Transparent fallback when the LLM is unavailable — an honest read of the
     indicators, never a fabricated one."""
     reasons: list[str] = []
@@ -300,9 +374,11 @@ def _rules_verdict(ind: Indicators, bullish: int, bearish: int) -> dict:
     score += 1 if bullish > bearish else -1 if bearish > bullish else 0
 
     if score >= 2:
-        action, conf = "BUY", 0.6
+        action, conf = ("ADD" if held else "BUY"), 0.6
     elif score <= -1:
-        action, conf = "SKIP", 0.6
+        # An owned position needs a clearer case against it than a candidate
+        # needs to be passed over, so only a decisively negative read trims.
+        action, conf = (("TRIM", 0.6) if score <= -2 else ("HOLD", 0.5)) if held else ("SKIP", 0.6)
     else:
         action, conf = "HOLD", 0.5
     detail = ", ".join(reasons) or "mixed signals"

@@ -22,6 +22,7 @@ import {
   useSetTargets,
   useTargets,
 } from "../../api/hooks";
+import type { Sizing } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { ExplainerSheet } from "../../components/MetricTile";
@@ -31,12 +32,51 @@ import { formatCurrency } from "../../utils/format";
 
 type Row = { symbol: string; pct: string };
 
+function SizingChoice({
+  active,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  const theme = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      style={{
+        flex: 1,
+        paddingVertical: 8,
+        alignItems: "center",
+        borderRadius: theme.radius.md,
+        borderWidth: 1,
+        borderColor: active ? theme.colors.primary : theme.colors.border,
+        backgroundColor: active ? theme.colors.primary + "22" : "transparent",
+      }}
+    >
+      <Text
+        style={{
+          color: active ? theme.colors.primary : theme.colors.textMuted,
+          fontSize: 13,
+          fontWeight: active ? "700" : "500",
+        }}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 export function RebalanceScreen() {
   const theme = useTheme();
   const portfolio = usePortfolio();
   const targets = useTargets();
   const setTargets = useSetTargets();
   const propose = useProposeRebalance();
+  // Same rule as the cash planner: a linked broker sells fractional shares, so
+  // dollar amounts are both placeable and exact. Without one, whole shares.
+  const [sizing, setSizing] = useState<Sizing | null>(null);
   const proposed = useProposedOrders();
   const markExecuted = useMarkExecuted();
   const reject = useRejectOrder();
@@ -47,23 +87,39 @@ export function RebalanceScreen() {
   const tradingAccount = (connections.data ?? []).find(
     (c) => c.trading_enabled && c.status === "active",
   );
+  const linked = (connections.data ?? []).length > 0;
+  const effectiveSizing: Sizing = sizing ?? (linked ? "dollars" : "shares");
   const explainers = useExplainers().data ?? {};
   const [rows, setRows] = useState<Row[]>([]);
   const [showExplainer, setShowExplainer] = useState(false);
 
-  // Seed the editor from saved targets, else current positions.
+  // Seed the editor from saved targets PLUS anything held that has no target
+  // yet. Seeding from targets alone hides a position you own the moment you
+  // save a set that omits it — it drops off this screen, and with a target of
+  // 0% the rebalancer then wants to sell all of it, which is a decision you
+  // never actually made.
   useEffect(() => {
     if (rows.length > 0) return;
-    if (targets.data && targets.data.length > 0) {
-      setRows(targets.data.map((t) => ({ symbol: t.symbol, pct: String(Math.round(t.weight * 100)) })));
-    } else if (portfolio.data?.positions.length) {
-      setRows(
-        portfolio.data.positions.map((p) => ({
-          symbol: p.symbol,
-          pct: String(Math.round(p.weight * 100)),
-        })),
-      );
+    const saved = targets.data ?? [];
+    const held = portfolio.data?.positions ?? [];
+    if (saved.length === 0 && held.length === 0) return;
+
+    const seeded: Row[] = saved.map((t) => ({
+      symbol: t.symbol,
+      pct: String(Math.round(t.weight * 100)),
+    }));
+    const known = new Set(seeded.map((r) => r.symbol.toUpperCase()));
+    for (const p of held) {
+      if (known.has(p.symbol.toUpperCase())) continue;
+      // Untargeted holdings seed at their current weight when there are no
+      // targets at all, and at 0% when there are — so the gap is visible and
+      // deliberate rather than silent.
+      seeded.push({
+        symbol: p.symbol,
+        pct: saved.length === 0 ? String(Math.round(p.weight * 100)) : "0",
+      });
     }
+    setRows(seeded);
   }, [targets.data, portfolio.data]);
 
   const total = rows.reduce((sum, r) => sum + (Number(r.pct) || 0), 0);
@@ -156,9 +212,22 @@ export function RebalanceScreen() {
             trades for anything drifted more than 5%. You place them at your own
             broker, then tap "I placed this" — your holdings update to match.
           </Text>
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+            <SizingChoice
+              active={effectiveSizing === "dollars"}
+              label="Dollar amounts"
+              onPress={() => setSizing("dollars")}
+            />
+            <SizingChoice
+              active={effectiveSizing === "shares"}
+              label="Whole shares"
+              onPress={() => setSizing("shares")}
+            />
+          </View>
+
           <Button
             title="Propose orders"
-            onPress={() => propose.mutate({})}
+            onPress={() => propose.mutate({ sizing: effectiveSizing })}
             loading={propose.isPending}
             style={{ marginTop: 12 }}
           />

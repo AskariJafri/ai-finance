@@ -42,7 +42,11 @@ import {
   WatchlistItem,
   ProjectionRequest,
   ProjectionResponse,
+  ActionAcceptRequest,
+  ActionPlan,
+  ActionPlanRequest,
   Proposal,
+  Sizing,
   ProposedOrder,
   RiskReport,
   Scenario,
@@ -504,7 +508,7 @@ export function useSetTargets() {
 export function useProposeRebalance() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (body: { drift_threshold?: number }) =>
+    mutationFn: async (body: { drift_threshold?: number; sizing?: Sizing }) =>
       (await api.post<Proposal>("/invest/rebalance/propose", body)).data,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["invest", "proposed"] }),
   });
@@ -519,7 +523,7 @@ export function useProposeRebalance() {
 export function useDeployPlan() {
   return useMutation({
     mutationFn: async (body: DeployPlanRequest) =>
-      (await api.post<DeployPlan>("/invest/deploy/propose", body, { timeout: 60_000 }))
+      (await api.post<DeployPlan>("/invest/deploy/propose", body, { timeout: 180_000 }))
         .data,
   });
 }
@@ -530,6 +534,35 @@ export function useAcceptDeployPlan() {
     mutationFn: async (body: DeployAcceptRequest) =>
       (await api.post<Proposal>("/invest/deploy/accept", body)).data,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["invest", "proposed"] }),
+  });
+}
+
+// --- AI portfolio actions ---
+/**
+ * One committee deliberation per held position *and* per shortlisted
+ * candidate, so this is the slowest call the app makes — a portfolio of five
+ * with a shortlist of five is ten round trips to the model.
+ *
+ * Measured at ~95s warm against the free tier, which ran straight past the old
+ * two-minute ceiling and surfaced as "could not build a plan" on a request that
+ * was actually still working. The server has no deadline of its own here, so
+ * this is the only limit that matters — set it above the slow case, not the
+ * typical one.
+ */
+export function useActionPlan() {
+  return useMutation({
+    mutationFn: async (body: ActionPlanRequest) =>
+      (await api.post<ActionPlan>("/invest/actions/propose", body, { timeout: 300_000 }))
+        .data,
+  });
+}
+
+export function useAcceptActionPlan() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: ActionAcceptRequest) =>
+      (await api.post<Proposal>("/invest/actions/accept", body)).data,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["invest"] }),
   });
 }
 

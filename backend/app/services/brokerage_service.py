@@ -18,7 +18,8 @@ replacement for it.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +33,9 @@ from app.integrations.snaptrade.gateway import (
     OrderType,
     SnapTradeError,
     SnapTradeGateway,
+    SnapTradePosition,
 )
+from app.repositories.ai_insights import AIInsightRepository
 from app.repositories.brokerage_connections import BrokerageConnectionRepository
 from app.repositories.holdings import HoldingRepository
 from app.repositories.proposed_orders import ProposedOrderRepository
@@ -44,9 +47,28 @@ from app.schemas.brokerage import (
 )
 from app.schemas.invest import ProposedOrderOut
 from app.services.errors import NotFound, ValidationFailed
+from app.services.invest_insight_service import KIND_HEALTH
 from app.services.invest_service import InvestService, order_out
 
 logger = get_logger(__name__)
+
+
+def _combine(existing: SnapTradePosition | None, incoming: SnapTradePosition) -> SnapTradePosition:
+    """Fold the same ticker held in two accounts into one position.
+
+    Quantities add; the cost basis is the share-weighted average of the two, so
+    the unrealized P/L the app shows matches what the user would compute across
+    both accounts by hand.
+    """
+    if existing is None:
+        return incoming
+    qty = existing.qty + incoming.qty
+    if qty <= 0:
+        return incoming
+    avg_cost_cents = round(
+        (existing.avg_cost_cents * existing.qty + incoming.avg_cost_cents * incoming.qty) / qty
+    )
+    return replace(existing, qty=qty, avg_cost_cents=avg_cost_cents)
 
 
 class BrokerageService:
@@ -65,6 +87,7 @@ class BrokerageService:
         self.holdings = HoldingRepository(session)
         self.proposals = ProposedOrderRepository(session)
         self.user_settings = UserSettingsRepository(session)
+        self.insights = AIInsightRepository(session)
 
     # --- credentials ---
     async def _credentials(self, user_id: uuid.UUID) -> tuple[str, str]:
@@ -133,8 +156,18 @@ class BrokerageService:
                 "No brokerage accounts found. Finish authorizing in the portal, then try again."
             )
 
+        # A closed account keeps coming back from SnapTrade forever. Storing it
+        # would leave the user staring at an account they deliberately disabled,
+        # with no way to remove it short of unlinking everything.
+        live = [a for a in accounts if a.is_open]
+        if not live:
+            raise ValidationFailed(
+                "Every account on this connection is closed at the broker. "
+                "Authorize an open account, then try again."
+            )
+
         rows = []
-        for account in accounts:
+        for account in live:
             rows.append(
                 await self.connections.upsert(
                     user_id=user_id,
@@ -151,8 +184,24 @@ class BrokerageService:
                     trading_enabled=settings.live_trading_enabled,
                 )
             )
+
+        # Drop connections the broker no longer reports as live — an account
+        # closed or de-authorized since the last link. Their mirrored holdings
+        # go with them on the sync below, which prunes anything unseen.
+        keep = {a.account_id for a in live}
+        for existing in await self.connections.list_for_user(user_id):
+            if existing.brokerage_account_id not in keep:
+                await self.connections.delete(existing)
         await self.session.commit()
-        return [_connection_out(r) for r in rows]
+
+        # Pull the positions in the same breath. Leaving this to a separate
+        # button is why a linked account could sit there showing nothing.
+        try:
+            await self.sync_positions(user_id)
+        except ValidationFailed as exc:
+            logger.warning("Link succeeded but position sync failed: %s", exc)
+
+        return [_connection_out(r) for r in await self.connections.list_for_user(user_id)]
 
     async def list_connections(self, user_id: uuid.UUID) -> list[BrokerageConnectionOut]:
         return [_connection_out(r) for r in await self.connections.list_for_user(user_id)]
@@ -181,52 +230,81 @@ class BrokerageService:
         if not connections:
             raise ValidationFailed("No brokerage accounts linked.")
 
-        seen: set[str] = set()
-        synced = 0
+        # One call covering every account, rather than one per connection.
+        try:
+            accounts = await self.gateway.list_accounts(
+                snaptrade_user_id=snaptrade_user_id, user_secret=secret
+            )
+        except SnapTradeError as exc:
+            raise ValidationFailed(f"Sync failed: {exc}") from exc
+        by_account = {a.account_id: a for a in accounts}
+
+        fx = await self.invest.market_data.latest_fx_rate() or 1.0
+        # Positions accumulate across accounts before anything is written:
+        # ``Holding`` is unique on (user, symbol), so writing per account would
+        # let a second account holding the same ticker overwrite the first
+        # rather than add to it.
+        merged: dict[str, SnapTradePosition] = {}
+        failures: list[str] = []
         cash_cents = 0
 
         for connection in connections:
+            account = by_account.get(connection.brokerage_account_id)
+            if account is not None and not account.is_open:
+                # Closed at the broker since the last sync. Drop it rather than
+                # keep reporting a dead account as ACTIVE forever.
+                await self.connections.delete(connection)
+                continue
+
             try:
                 positions = await self.gateway.list_positions(
                     snaptrade_user_id=snaptrade_user_id,
                     user_secret=secret,
                     account_id=connection.brokerage_account_id,
                 )
-                accounts = await self.gateway.list_accounts(
-                    snaptrade_user_id=snaptrade_user_id, user_secret=secret
-                )
             except SnapTradeError as exc:
+                # One unreachable account must not cost the user every other
+                # account's positions, so record it and carry on.
+                logger.warning(
+                    "Position sync failed for account %s: %s",
+                    connection.brokerage_account_id,
+                    exc,
+                )
                 await self.connections.mark_status(connection, BrokerageConnectionStatus.ERROR)
-                await self.session.commit()
-                raise ValidationFailed(f"Sync failed: {exc}") from exc
+                failures.append(connection.account_name or connection.brokerage_account_id)
+                continue
 
-            for account in accounts:
-                if account.account_id == connection.brokerage_account_id:
-                    connection.cash_cents = account.cash_cents
-                    connection.total_value_cents = account.total_value_cents
-            cash_cents += connection.cash_cents
+            if account is not None:
+                connection.cash_cents = account.cash_cents
+                connection.total_value_cents = account.total_value_cents
+            # Sub-accounts can be denominated differently; the app's cash figure
+            # is CAD, so convert before summing.
+            rate = fx if connection.currency.upper() == "USD" else 1.0
+            cash_cents += round(connection.cash_cents * rate)
 
             for position in positions:
                 if position.qty <= 0:
                     continue
-                await self.holdings.upsert(
-                    user_id=user_id,
-                    symbol=position.symbol,
-                    qty=position.qty,
-                    avg_cost_cents=position.avg_cost_cents,
-                    currency=position.currency,
-                    name=position.name,
-                    is_synced=True,
-                )
-                seen.add(position.symbol.upper())
-                synced += 1
+                key = position.symbol.upper()
+                merged[key] = _combine(merged.get(key), position)
 
             connection.status = BrokerageConnectionStatus.ACTIVE
             connection.last_synced_at = datetime.now(UTC)
 
+        for symbol, position in merged.items():
+            await self.holdings.upsert(
+                user_id=user_id,
+                symbol=symbol,
+                qty=position.qty,
+                avg_cost_cents=position.avg_cost_cents,
+                currency=position.currency,
+                name=position.name,
+                is_synced=True,
+            )
+
         removed = 0
         for holding in await self.holdings.list_synced(user_id):
-            if holding.symbol.upper() not in seen:
+            if holding.symbol.upper() not in merged:
                 await self.holdings.delete(user_id, holding.id)
                 removed += 1
 
@@ -235,8 +313,24 @@ class BrokerageService:
         user_settings.invest_cash_cents = cash_cents
 
         await self.session.commit()
+
+        # A position with no cached bars prices as "stale" everywhere until an
+        # unrelated market-data sync runs, which reads to the user as the
+        # holding never having arrived.
+        if merged:
+            await self.invest.market_data.sync_bars(sorted(merged))
+            await self.session.commit()
+
+        # The cached portfolio review describes the holdings as they were before
+        # this sync; drop it so the next read regenerates against the new ones.
+        await self.insights.delete(user_id, KIND_HEALTH, date.today().strftime("%Y-%m"))
+        await self.session.commit()
+
         return BrokerageSyncOut(
-            positions_synced=synced, positions_removed=removed, cash_cents=cash_cents
+            positions_synced=len(merged),
+            positions_removed=removed,
+            cash_cents=cash_cents,
+            failed_accounts=failures,
         )
 
     # --- execution ---
@@ -266,8 +360,10 @@ class BrokerageService:
             # Notional/fractional orders are a market-order-only Alpaca feature
             # that the aggregator does not carry across brokers.
             raise ValidationFailed(
-                "This order has no share quantity. Fractional orders can't be "
-                "routed to your broker — mark it executed by hand instead."
+                "This order is sized in dollars, and a notional amount can't be "
+                "routed through SnapTrade. Re-run the plan with share sizing to "
+                "place it here, or buy the dollar amount at your broker and mark "
+                "it executed by hand."
             )
 
         try:
