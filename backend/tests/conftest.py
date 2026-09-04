@@ -20,6 +20,9 @@ from app.ai.llm.openai_compat import reset_quota_breaker
 from app.core.config import settings
 from app.db.base import Base
 from app.db.session import get_session
+from app.integrations.marketdata.factory import get_market_data_provider
+from app.integrations.news.factory import get_news_provider
+from app.integrations.websearch.factory import get_websearch_provider
 from app.main import create_app
 from app.repositories.rules import CategoryRuleRepository
 
@@ -44,11 +47,26 @@ def _llm_configured(monkeypatch):
     """
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_fallbacks", [])
-    get_llm_provider.cache_clear()
+    _clear_provider_caches()
     reset_quota_breaker()
     yield
-    get_llm_provider.cache_clear()
+    _clear_provider_caches()
     reset_quota_breaker()
+
+
+def _clear_provider_caches() -> None:
+    """Every ``lru_cache``d provider factory, not just the LLM one.
+
+    Tests choose mock vs real by monkeypatching a settings flag and letting the
+    factory decide — but the factory memoizes, so whichever test touches one
+    first pins that choice for the whole session. ``get_market_data_provider``
+    had this latent order-dependency already: eight test modules patch
+    ``market_data_use_mock`` and none of them were clearing it.
+    """
+    get_llm_provider.cache_clear()
+    get_market_data_provider.cache_clear()
+    get_news_provider.cache_clear()
+    get_websearch_provider.cache_clear()
 
 
 @pytest_asyncio.fixture

@@ -103,11 +103,26 @@ class AccountOut(BaseModel):
     equity: float  # invested + cash, in CAD
     cash: float
     invested: float
+    # What the positions cost, and what they are up or down against that — the
+    # portfolio-level roll-up of the same numbers each position row carries.
+    # All CAD; cash is excluded, since uninvested cash has no P/L.
+    cost_basis: float = 0.0
+    unrealized_pl: float = 0.0
+    unrealized_pl_pct: float = 0.0
+    # Move over the last cached session vs the one before it. ``None`` when no
+    # position has two sessions cached — a brand-new portfolio has no
+    # yesterday to compare against, which is not the same as a flat day.
+    day_pl: float | None = None
+    day_pl_pct: float | None = None
 
 
 class PortfolioOut(BaseModel):
     connected: bool  # false = no holdings entered yet
     as_of: str | None = None
+    # Date of the most recent daily bar the positions are priced from. Prices
+    # come from the close cache, so on a trading day this trails ``as_of`` --
+    # the UI labels the day change with this, never with "today".
+    prices_as_of: str | None = None
     currency: str = "CAD"
     usd_cad_rate: float | None = None
     account: AccountOut | None = None
@@ -158,12 +173,36 @@ class CorrelationOut(BaseModel):
     matrix: list[list[float]]
 
 
+class FactorExposureOut(BaseModel):
+    key: str
+    name: str
+    exposure: float
+    variance_share: float
+    contrib_vol: float
+    standalone_vol: float
+    unit: str | None = None
+    duration_years: float | None = None
+
+
+class FactorRiskOut(BaseModel):
+    exposures: list[FactorExposureOut] = []
+    factor_vol: float | None = None
+    idiosyncratic_vol: float | None = None
+    total_vol: float | None = None
+    r_squared: float | None = None
+    diversification_benefit: float | None = None
+    factors_used: list[str] = []
+    factors_unavailable: list[str] = []
+    reason: str | None = None
+
+
 class RiskOut(BaseModel):
     window: str
     portfolio: PortfolioRisk
     concentration: Concentration | None = None
     per_position: list[PositionRisk] = []
     correlation: CorrelationOut | None = None
+    factors: FactorRiskOut | None = None
     risk_free_rate: float
     data_quality: DataQuality
     reason: str | None = None
@@ -385,6 +424,24 @@ class DeployPassedOut(BaseModel):
     reason: str
 
 
+class ResearchOut(BaseModel):
+    """What the research layer contributed to a plan.
+
+    Additive and optional: a client that ignores it sees exactly the response
+    it saw before the layer existed. ``stale`` follows the same convention as
+    ``PortfolioOut.stale_symbols`` — a degraded research layer is reported, not
+    raised.
+    """
+
+    as_of: str
+    macro_regime: str | None = None  # risk_on | risk_off | mixed
+    macro_summary: str | None = None
+    macro_headlines: list[str] = []
+    symbols_with_news: int = 0
+    stale: bool = False
+    stale_reason: str | None = None
+
+
 class DeployPlanOut(BaseModel):
     amount: float
     sizing: Sizing = "shares"
@@ -393,8 +450,11 @@ class DeployPlanOut(BaseModel):
     invested: float
     cash_remaining: float
     considered: int
-    source: str  # ai | rules
+    # ai = every ticker got a model verdict; mixed = some fell back to rules
+    # mid-scan; rules = none did. Derived from the verdicts, not from a gate.
+    source: str  # ai | mixed | rules
     note: str
+    research: ResearchOut | None = None
     disclaimer: str = INVEST_DISCLAIMER
 
 
@@ -450,6 +510,53 @@ class ActionHoldOut(BaseModel):
     reason: str
 
 
+class PlanFactorOut(BaseModel):
+    """One factor, where the book sits today and where the plan would leave it."""
+
+    key: str
+    name: str
+    exposure: float
+    projected_exposure: float
+    share_of_risk: float
+    projected_share_of_risk: float
+    duration_years: float | None = None
+    projected_duration_years: float | None = None
+
+
+class FactorBreachOut(BaseModel):
+    """A limit the plan ran into.
+
+    ``binding`` separates the two cases that look alike in a list and are not:
+    the plan was cut back to stay inside the line, or the line is already
+    crossed by holdings this plan cannot fix by buying less.
+    """
+
+    key: str
+    name: str
+    current: float
+    projected: float
+    limit: float
+    unit: str  # exposure | share | years
+    binding: bool
+    message: str
+
+
+class FactorPlanOut(BaseModel):
+    factors: list[PlanFactorOut] = []
+    idiosyncratic_share: float | None = None
+    projected_idiosyncratic_share: float | None = None
+    total_vol: float | None = None
+    projected_total_vol: float | None = None
+    breaches: list[FactorBreachOut] = []
+    #: Whether a limit actually changed the plan, as opposed to merely warning.
+    enforced: bool = False
+    #: Why there is nothing here, when there is nothing here.
+    reason: str | None = None
+
+    def projected_exposure(self, key: str) -> float | None:
+        return next((f.projected_exposure for f in self.factors if f.key == key), None)
+
+
 class ActionPlanOut(BaseModel):
     as_of: str
     currency: str = "CAD"
@@ -461,8 +568,10 @@ class ActionPlanOut(BaseModel):
     holds: list[ActionHoldOut]
     passed: list[DeployPassedOut]
     considered: int
-    source: str  # ai | rules
+    source: str  # ai | mixed | rules
     note: str
+    research: ResearchOut | None = None
+    factors: FactorPlanOut | None = None
     disclaimer: str = INVEST_DISCLAIMER
 
 

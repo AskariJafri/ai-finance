@@ -247,11 +247,13 @@ async def test_a_fractional_position_is_never_silently_dropped(client: AsyncClie
         headers=headers,
         json={"symbol": "VFV.TO", "qty": 10, "avg_cost": 100.0},
     )
-    # AAPL has no target at all, so the whole position should be sold.
+    # An explicit 0% target on AAPL: "I hold this and want none of it", so the
+    # whole position should be sold. Omitting it instead would mean AAPL is
+    # simply unmanaged, which this planner now leaves alone.
     await client.put(
         f"{PREFIX}/invest/targets",
         headers=headers,
-        json=[{"symbol": "VFV.TO", "weight": 1.0}],
+        json=[{"symbol": "VFV.TO", "weight": 1.0}, {"symbol": "AAPL", "weight": 0.0}],
     )
 
     dollars = await client.post(
@@ -355,9 +357,12 @@ async def test_a_trade_conserves_the_account_total(client: AsyncClient):
             json={"symbol": symbol, "qty": 10, "avg_cost": 100.0},
         )
     await client.put(f"{PREFIX}/invest/cash", headers=headers, json={"cash": 500})
-    # XEQT has no target, so the rebalancer proposes selling all of it.
+    # An explicit 0% target on XEQT, so the rebalancer proposes selling all of
+    # it — an omitted symbol is unmanaged and would be left alone instead.
     await client.put(
-        f"{PREFIX}/invest/targets", headers=headers, json=[{"symbol": "VFV.TO", "weight": 1.0}]
+        f"{PREFIX}/invest/targets",
+        headers=headers,
+        json=[{"symbol": "VFV.TO", "weight": 1.0}, {"symbol": "XEQT.TO", "weight": 0.0}],
     )
 
     before = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
@@ -421,3 +426,84 @@ async def test_a_bought_position_is_paid_for_out_of_cash(client: AsyncClient):
     after = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
     assert after["account"]["cash"] < before["account"]["cash"]
     assert after["account"]["equity"] == pytest.approx(before["account"]["equity"], abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_a_holding_with_no_target_is_left_alone_not_liquidated(client: AsyncClient):
+    """The two planners must not contradict each other.
+
+    Reported from a live account: the AI actions planner recommended buying
+    AVGO, the user bought it, and the very next rebalance said sell AVGO and
+    buy NVDA. Neither planner was malfunctioning — the actions planner shops
+    names you do not own, ``accept`` never writes a target row, and rebalance
+    read that missing row as a 0% target. So every name the committee ever
+    recommended came back marked for liquidation the moment it was bought.
+
+    A missing target means unmanaged. Only an explicit 0% means sell out.
+    """
+    headers = await _register(client, "avgo@test.com")
+    for symbol, qty in (("VFV.TO", 10), ("XEQT.TO", 10), ("AAPL", 2)):
+        await client.put(
+            f"{PREFIX}/invest/holdings",
+            headers=headers,
+            json={"symbol": symbol, "qty": qty, "avg_cost": 100.0},
+        )
+    # AAPL is the newly bought name: held, but absent from the target mix.
+    await client.put(
+        f"{PREFIX}/invest/targets",
+        headers=headers,
+        json=[{"symbol": "VFV.TO", "weight": 0.5}, {"symbol": "XEQT.TO", "weight": 0.5}],
+    )
+
+    body = (
+        await client.post(
+            f"{PREFIX}/invest/rebalance/propose",
+            headers=headers,
+            json={"drift_threshold": 0.01, "sizing": "dollars"},
+        )
+    ).json()
+
+    assert not [o for o in body["orders"] if o["symbol"] == "AAPL"], (
+        "a holding with no target row must never be proposed for sale"
+    )
+    # Silence would read as "on target" — the plan has to say why it is absent.
+    assert "AAPL" in body["note"]
+    assert "no target weight" in body["note"]
+
+    # And the targeted names are measured against the sleeve they govern, not
+    # against an account that still counts the position being left alone — with
+    # AAPL in the denominator both would read underweight by its size.
+    #
+    # The sleeve is self-funding: with no cash in the account, what it sells is
+    # exactly what it buys. A single dollar of difference would mean AAPL's
+    # value had leaked into the target math after all.
+    assert body["total_buy"] == pytest.approx(body["total_sell"], abs=0.02)
+    assert body["total_buy"] > 0
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_zero_target_still_sells_out(client: AsyncClient):
+    """The escape hatch the fix above depends on."""
+    headers = await _register(client, "zerotarget@test.com")
+    for symbol, qty in (("VFV.TO", 10), ("AAPL", 2)):
+        await client.put(
+            f"{PREFIX}/invest/holdings",
+            headers=headers,
+            json={"symbol": symbol, "qty": qty, "avg_cost": 100.0},
+        )
+    await client.put(
+        f"{PREFIX}/invest/targets",
+        headers=headers,
+        json=[{"symbol": "VFV.TO", "weight": 1.0}, {"symbol": "AAPL", "weight": 0.0}],
+    )
+
+    body = (
+        await client.post(
+            f"{PREFIX}/invest/rebalance/propose",
+            headers=headers,
+            json={"drift_threshold": 0.01, "sizing": "dollars"},
+        )
+    ).json()
+    sells = [o for o in body["orders"] if o["symbol"] == "AAPL" and o["side"] == "sell"]
+    assert sells, "an explicit 0% target is a decision and must still sell out"
+    assert "no target weight" not in body["note"]

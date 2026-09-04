@@ -5,6 +5,7 @@ import uuid
 from fastapi import APIRouter, Query, status
 
 from app.api.deps import (
+    BrokerageServiceDep,
     CurrentUser,
     InvestInsightServiceDep,
     InvestServiceDep,
@@ -190,9 +191,16 @@ async def mark_executed(
     body: MarkExecutedIn,
     user: CurrentUser,
     service: InvestServiceDep,
+    brokerage: BrokerageServiceDep,
 ) -> ProposedOrderOut:
     """The user placed this trade at their own broker — update holdings."""
-    return await service.mark_executed(user.id, order_id, body.fill_price)
+    result = await service.mark_executed(user.id, order_id, body.fill_price)
+    # A linked account is mirrored, not simulated: re-read the broker so the
+    # holdings are its numbers rather than the estimate `apply_fill` just made.
+    # A no-op for hand-entered portfolios, and never fatal — the fill is
+    # already committed.
+    await brokerage.resync_after_fill(user.id)
+    return result
 
 
 @router.post("/orders/proposed/{order_id}/reject", response_model=ProposedOrderOut)

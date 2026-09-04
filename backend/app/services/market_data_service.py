@@ -14,6 +14,7 @@ from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.factor_risk import PROXY_SYMBOLS
 from app.core.logging import get_logger
 from app.integrations.marketdata.provider import (
     CandleSeries,
@@ -41,7 +42,11 @@ class MarketDataService:
         self.bars = PriceBarRepository(session)
 
     async def sync_bars(
-        self, symbols: list[str], since: date_type | None = None
+        self,
+        symbols: list[str],
+        since: date_type | None = None,
+        *,
+        refresh_today: bool = False,
     ) -> tuple[int, int, list[str]]:
         """Fetch missing daily bars for symbols + benchmark + FX.
 
@@ -50,6 +55,14 @@ class MarketDataService:
         scanner passes a much shorter window instead: it ranks a universe far
         wider than any one portfolio, and pulling fifteen years for every
         candidate would cost more than the scan is worth.
+
+        `refresh_today` re-fetches today's bar even when one is already cached.
+        Today's "daily close" is not a close at all while the market is open —
+        it is a snapshot that moves all session. Treating it as cached froze
+        every price at whatever the first sync of the day happened to see, so
+        pressing Sync again changed nothing until tomorrow. Off by default:
+        most callers want the cache, and a universe scan re-fetching sixty-odd
+        symbols on every pass is exactly what the cache exists to prevent.
 
         Fetches run concurrently, writes do not — an `AsyncSession` is not safe
         for concurrent use, so the network phase fans out and the upsert phase
@@ -60,11 +73,20 @@ class MarketDataService:
         """
         today = date_type.today()
         want_start = since or HISTORY_START
-        wanted = sorted({s.upper() for s in symbols} | {BENCHMARK, FX_SYMBOL})
+        # The factor proxies ride along with every sync for the same reason
+        # the benchmark does: the risk decomposition is worthless if they lag
+        # the holdings, and they are a fixed handful of liquid ETFs.
+        wanted = sorted(
+            {s.upper() for s in symbols}
+            | {BENCHMARK, FX_SYMBOL}
+            | {p.upper() for p in PROXY_SYMBOLS}
+        )
 
         jobs: list[tuple[str, date_type, date_type]] = []
         for symbol in wanted:
-            jobs.extend(await self._missing_ranges(symbol, want_start, today))
+            jobs.extend(
+                await self._missing_ranges(symbol, want_start, today, refresh_today=refresh_today)
+            )
         if not jobs:
             return 0, 0, []
 
@@ -93,7 +115,7 @@ class MarketDataService:
                 continue
             if not points:
                 continue
-            added = await self.bars.bulk_upsert(symbol, points)
+            added = await self.bars.bulk_upsert(symbol, points, overwrite=refresh_today)
             if added:
                 updated.add(symbol)
                 bars_added += added
@@ -101,7 +123,12 @@ class MarketDataService:
         return len(updated), bars_added, failed
 
     async def _missing_ranges(
-        self, symbol: str, want_start: date_type, today: date_type
+        self,
+        symbol: str,
+        want_start: date_type,
+        today: date_type,
+        *,
+        refresh_today: bool = False,
     ) -> list[tuple[str, date_type, date_type]]:
         """Date ranges we don't already have cached for `symbol`.
 
@@ -121,6 +148,11 @@ class MarketDataService:
             ranges.append((symbol, want_start, earliest - timedelta(days=1)))
         if latest < today:
             ranges.append((symbol, latest + timedelta(days=1), today))
+        elif refresh_today:
+            # Already have a bar dated today, and the caller wants it re-read
+            # rather than trusted. The upsert overwrites by (symbol, date), so
+            # this replaces the snapshot instead of duplicating it.
+            ranges.append((symbol, today, today))
         return ranges
 
     async def lookup(self, symbol: str) -> SymbolQuote:
@@ -135,11 +167,24 @@ class MarketDataService:
         return await self.provider.get_candles(symbol.upper(), interval, range_)
 
     async def latest_close(self, symbol: str) -> float | None:
-        latest = await self.bars.latest_date(symbol.upper())
-        if latest is None:
-            return None
-        series = await self.bars.get_series(symbol.upper(), start=latest, end=latest)
-        return series[0][1] if series else None
+        closes = await self.bars.recent_closes(symbol.upper(), limit=1)
+        return closes[-1][1] if closes else None
+
+    async def last_two_closes(
+        self, symbol: str
+    ) -> tuple[tuple[date_type, float] | None, tuple[date_type, float] | None]:
+        """``(previous_session, latest_session)`` from the daily-bar cache.
+
+        Both are ``None`` when the symbol has no cached bars, and only the
+        previous one is ``None`` when a single session is cached (a freshly
+        added ticker) — day change is unknowable then, not zero.
+        """
+        closes = await self.bars.recent_closes(symbol.upper(), limit=2)
+        if not closes:
+            return None, None
+        if len(closes) == 1:
+            return None, closes[0]
+        return closes[0], closes[1]
 
     async def latest_fx_rate(self) -> float | None:
         """USD -> CAD."""

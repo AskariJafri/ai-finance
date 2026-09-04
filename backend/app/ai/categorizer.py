@@ -13,7 +13,9 @@ import json
 import re
 
 from app.ai.llm.base import LLMProvider
+from app.ai.llm.budget import llm_budget
 from app.ai.prompts import CATEGORIZE_SYSTEM, build_categorize_prompt
+from app.core.config import settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,9 +42,17 @@ class AICategorizer:
             category_names=category_names,
         )
         try:
-            raw = await self.llm.complete(
-                prompt, system=CATEGORIZE_SYSTEM, temperature=0.0, json_object=True
-            )
+            # No wait budget: a sync runs unattended, so a slow endpoint should
+            # be skipped rather than sat out. The token cap is the point here —
+            # this answer is a slug and a number.
+            with llm_budget(
+                wait=None,
+                max_pass_sleep=0.0,
+                max_output_tokens=settings.llm_categorizer_max_tokens,
+            ):
+                raw = await self.llm.complete(
+                    prompt, system=CATEGORIZE_SYSTEM, temperature=0.0, json_object=True
+                )
         except Exception as exc:  # LLMUnavailable or anything unexpected
             logger.warning("AI categorization unavailable: %s", exc)
             return None, 0.0

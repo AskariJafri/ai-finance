@@ -62,6 +62,8 @@ credential belongs in **Secrets**, not Variables.
 | `DEBUG` | `false` |
 | `CORS_ORIGINS` | Explicit origins if a web client is ever added |
 | `PLAID_*`, `SNAPTRADE_*` | Optional — both degrade to mock clients when unset |
+| `FINNHUB_API_KEY` | Company news for the AI committee. Leave unset to run with research off — every surface falls back to figures-only |
+| `TAVILY_API_KEY` | Macro/world web search. One call a day for the whole app; optional and independent of Finnhub |
 
 ### Free-tier behaviour worth knowing
 

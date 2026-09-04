@@ -326,19 +326,41 @@ export type Position = {
   /** True when the row is mirrored from a linked brokerage account. */
   is_synced: boolean;
   price: number;
+  /** Date of the close `price` came from — bars, so it can trail today. */
+  price_date: string;
   avg_cost: number;
+  cost_basis: number; // CAD
   market_value: number; // CAD
   unrealized_pl: number;
   unrealized_pl_pct: number;
+  /** Prior session's close, in the listing currency. Null = no prior bar. */
+  prev_close: number | null;
+  /** Day-over-day move per share, in the listing currency. */
+  day_change: number | null;
+  day_change_pct: number | null;
+  /** The position's share of the day's move, in CAD. */
+  day_pl: number | null;
   weight: number;
 };
 
 export type Portfolio = {
   connected: boolean; // false = no holdings entered yet
   as_of: string | null;
+  /** Latest close date behind the prices — what the day change is measured on. */
+  prices_as_of: string | null;
   currency: string; // "CAD"
   usd_cad_rate: number | null;
-  account: { equity: number; cash: number; invested: number } | null;
+  account: {
+    equity: number;
+    cash: number;
+    invested: number;
+    cost_basis: number;
+    unrealized_pl: number;
+    unrealized_pl_pct: number;
+    /** Null when no position has a prior session cached — unknown, not flat. */
+    day_pl: number | null;
+    day_pl_pct: number | null;
+  } | null;
   positions: Position[];
   stale_symbols: string[];
   disclaimer: string;
@@ -625,6 +647,49 @@ export type ActionHold = {
   reason: string;
 };
 
+/** One factor, where the book sits now and where the plan would leave it. */
+export type PlanFactor = {
+  key: string;
+  name: string;
+  exposure: number;
+  projected_exposure: number;
+  /** Share of the portfolio's factor risk, not of its value. */
+  share_of_risk: number;
+  projected_share_of_risk: number;
+  duration_years: number | null;
+  projected_duration_years: number | null;
+};
+
+export type FactorBreach = {
+  key: string;
+  name: string;
+  current: number;
+  projected: number;
+  limit: number;
+  unit: "exposure" | "share" | "years";
+  /**
+   * true: the plan was cut back to stay inside this line.
+   * false: the line is already crossed by holdings, and buying less would not
+   * bring it back — a warning, not something this plan did.
+   */
+  binding: boolean;
+  message: string;
+};
+
+/** What kind of risk the plan leaves behind, and which house limits it met. */
+export type FactorPlan = {
+  factors: PlanFactor[];
+  idiosyncratic_share: number | null;
+  projected_idiosyncratic_share: number | null;
+  total_vol: number | null;
+  projected_total_vol: number | null;
+  breaches: FactorBreach[];
+  /** Whether a limit actually changed the plan, as opposed to only warning. */
+  enforced: boolean;
+  /** Why there is nothing here, when there is nothing here. */
+  reason: string | null;
+};
+
 export type ActionPlan = {
   as_of: string;
   currency: string;
@@ -639,6 +704,7 @@ export type ActionPlan = {
   /** "mixed" means some verdicts fell back to rules when the model was down. */
   source: "ai" | "mixed" | "rules";
   note: string;
+  factors: FactorPlan | null;
   disclaimer: string;
 };
 

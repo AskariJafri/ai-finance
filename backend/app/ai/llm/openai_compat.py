@@ -27,10 +27,13 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
 from app.ai.llm.base import LLMProvider, LLMUnavailable
+from app.ai.llm.budget import current_budget
 from app.core.config import settings
 from app.core.logging import get_logger
 
@@ -103,9 +106,11 @@ def _open_quota_breaker(key: str, resp) -> None:
             # Milliseconds since the epoch, in the provider's own clock.
             until = float(reset) / 1000.0
         except (TypeError, ValueError):
-            # Some providers report a duration ("2m59.56s") instead. Unparseable
-            # means we simply don't know, which the default already covers.
-            until = now + _DEFAULT_QUOTA_COOLDOWN
+            # Groq reports a duration ("2m59.56s") instead of a timestamp.
+            # Reading it is the difference between standing this endpoint down
+            # for three minutes and standing it down for the default fifteen.
+            offset = _parse_duration(str(reset))
+            until = now + (offset if offset is not None else _DEFAULT_QUOTA_COOLDOWN)
     if not now < until <= now + 26 * 3600:
         # A seconds-valued epoch divided by 1000 lands in 1970, and a past
         # timestamp would leave the breaker closed while looking set — the
@@ -161,9 +166,14 @@ class OpenAICompatProvider(LLMProvider):
         max_concurrency: int | None = None,
         extra_body: dict | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        label: str = "",
     ) -> None:
         self.base_url = (base_url or settings.llm_base_url).rstrip("/")
         self.model = model or settings.llm_model
+        # Human-readable name for logs. With ten endpoints configured, a log
+        # line naming only the base_url is unreadable when several models share
+        # one host.
+        self.label = label or f"{self.base_url} ({self.model})"
         self.api_key = api_key if api_key is not None else settings.llm_api_key
         self.timeout = timeout or settings.llm_timeout_seconds
         # Per-endpoint because rate limits are per account — see `_limiter`.
@@ -202,11 +212,20 @@ class OpenAICompatProvider(LLMProvider):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+        # A surface may ask for less than the endpoint's ceiling, never more.
+        # This matters on a provider metered by tokens per minute, where
+        # max_tokens is *reserved* against the budget: the categorizer's
+        # twenty-token answer used to reserve 3,500, so six concurrent
+        # categorizations exhausted an 8,000/minute allowance on their own.
+        max_tokens = self.max_tokens
+        surface_cap = current_budget().max_output_tokens
+        if surface_cap is not None:
+            max_tokens = min(max_tokens, surface_cap)
         payload: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens,
             "stream": False,
         }
         if "openrouter.ai" in self.base_url:
@@ -226,15 +245,18 @@ class OpenAICompatProvider(LLMProvider):
                 payload[key] = value
         return payload
 
-    @staticmethod
-    def _content(data: dict) -> str:
+    def _content(self, data: dict) -> str:
         # A 200 can still carry a provider-level error (OpenRouter does this when
         # an upstream model is out of capacity).
         if isinstance(data.get("error"), dict):
-            raise LLMUnavailable(str(data["error"].get("message") or data["error"]))
+            raise LLMUnavailable(
+                str(data["error"].get("message") or data["error"]),
+                kind="bad_response",
+                endpoint=self.label,
+            )
         choices = data.get("choices") or []
         if not choices:
-            raise LLMUnavailable("no choices in response")
+            raise LLMUnavailable("no choices in response", kind="bad_response", endpoint=self.label)
         message = choices[0].get("message") or {}
         content = _strip_reasoning(message.get("content") or "")
         if choices[0].get("finish_reason") == "length":
@@ -242,7 +264,22 @@ class OpenAICompatProvider(LLMProvider):
             # that usually means the answer never started and what came back is
             # raw scratchpad, so this degrades to the reviewed fallback rather
             # than showing the model thinking out loud.
-            raise LLMUnavailable("response truncated before the answer completed")
+            #
+            # ``bad_response``, not a health problem: the endpoint answered
+            # promptly and correctly, the answer was just too long for the
+            # budget. Benching it would take a working endpoint out of the pool
+            # for a minute over a `max_tokens` mistake.
+            raise LLMUnavailable(
+                "response truncated before the answer completed",
+                kind="bad_response",
+                endpoint=self.label,
+            )
+        if not content.strip():
+            # A 200, a normal finish reason, and nothing in it. Previously this
+            # returned "" and the pool never learned anything failed — so the
+            # next member was never tried, chat silently fell to its glossary
+            # and the committee to rules, with no log line to explain either.
+            raise LLMUnavailable("empty response body", kind="bad_response", endpoint=self.label)
         return content
 
     async def complete(
@@ -253,39 +290,80 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float = 0.0,
         json_object: bool = False,
     ) -> str:
+        budget = current_budget()
         if not self.api_key:
-            raise LLMUnavailable("no LLM_API_KEY configured")
-        if self.quota_cooldown_remaining() > 0:
+            raise LLMUnavailable("no LLM_API_KEY configured", kind="bad_key", endpoint=self.label)
+        cooldown = self.quota_cooldown_remaining()
+        if cooldown > 0:
             # Fail here rather than at the provider: the committee makes one
             # call per ticker, and ten round trips to be told the same thing is
             # ninety seconds the user waits to reach the same rules-based plan.
-            raise LLMUnavailable("daily quota exhausted")
+            raise LLMUnavailable(
+                "daily quota exhausted",
+                kind="quota_exhausted",
+                retry_after=cooldown,
+                endpoint=self.label,
+            )
 
         payload = self._payload(prompt, system, temperature, json_object)
         async with _limiter(self.quota_key, self.max_concurrency):
-            return await self._post_with_retry(payload)
+            return await self._post_with_retry(payload, budget.remaining())
 
-    async def _post_with_retry(self, payload: dict) -> str:
+    async def _post_with_retry(self, payload: dict, remaining: float | None = None) -> str:
         url = f"{self.base_url}/chat/completions"
+        # Never hold a socket open past the request's own deadline. With a long
+        # pool the global 45s timeout x 2 attempts x N members outlives even the
+        # most generous client timeout, so the client hangs up while the server
+        # is still spending quota on an answer nobody will read.
+        timeout = self.timeout
+        if remaining is not None:
+            timeout = max(1.0, min(timeout, remaining))
         last: Exception | None = None
 
         for attempt in (1, 2):
             try:
-                async with self._client(self.timeout) as client:
+                async with self._client(timeout) as client:
                     resp = await client.post(url, json=payload, headers=self._headers())
 
                 if resp.status_code == 429:
                     _open_quota_breaker(self.quota_key, resp)
-                    if self.quota_cooldown_remaining() > 0:
+                    cooldown = self.quota_cooldown_remaining()
+                    if cooldown > 0:
                         # Out for the day — retrying costs time and tells us
                         # nothing new.
-                        raise LLMUnavailable("daily quota exhausted")
+                        raise LLMUnavailable(
+                            "daily quota exhausted",
+                            kind="quota_exhausted",
+                            retry_after=cooldown,
+                            endpoint=self.label,
+                        )
                     wait = _retry_after(resp)
                     if attempt == 1 and wait <= _MAX_RETRY_WAIT:
                         logger.warning("LLM rate limited; retrying in %.1fs", wait)
                         await asyncio.sleep(wait)
                         continue
-                    raise LLMUnavailable("rate limited (429)")
+                    # Past the in-member cap. The wait is NOT discarded — it
+                    # rides out on the exception so the pool can decide whether
+                    # to sit it out. The cap stays low here because this sleep
+                    # happens with the concurrency semaphore held, where a long
+                    # wait would starve every sibling call; a long wait belongs
+                    # to the pool, outside the semaphore.
+                    raise LLMUnavailable(
+                        f"rate limited (429), retry in {wait:.0f}s",
+                        kind="rate_limited",
+                        retry_after=wait,
+                        endpoint=self.label,
+                    )
+
+                if resp.status_code in (401, 403):
+                    # A rejected key does not fix itself. Retrying it every
+                    # minute forever is how a dead endpoint keeps costing
+                    # latency on every single request.
+                    raise LLMUnavailable(
+                        f"endpoint rejected the API key ({resp.status_code})",
+                        kind="bad_key",
+                        endpoint=self.label,
+                    )
 
                 # Some models reject response_format outright — retry as plain
                 # text, since the prompts ask for JSON anyway and the callers
@@ -308,7 +386,11 @@ class OpenAICompatProvider(LLMProvider):
                 break
 
         logger.warning("LLM request failed: %s", last)
-        raise LLMUnavailable(str(last)) from last
+        raise LLMUnavailable(
+            str(last),
+            kind="transport" if isinstance(last, httpx.HTTPError) else "bad_response",
+            endpoint=self.label,
+        ) from last
 
     def quota_cooldown_remaining(self) -> float:
         """Seconds until this endpoint's daily quota resets, 0 when it has not
@@ -344,11 +426,48 @@ class OpenAICompatProvider(LLMProvider):
         return self._available
 
 
+#: Providers spell "come back later" three different ways in the same family of
+#: headers: plain seconds, an HTTP-date, and a Go-style duration. Groq uses the
+#: last (`"2m59.56s"`), which parsed as neither and silently became the default.
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|h|m|s)")
+_DURATION_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _parse_duration(value: str) -> float | None:
+    """Seconds from a Go-style duration like ``2m59.56s``, or None."""
+    matches = _DURATION_RE.findall(value.strip())
+    if not matches:
+        return None
+    return sum(float(amount) * _DURATION_UNITS[unit] for amount, unit in matches)
+
+
 def _retry_after(resp: httpx.Response) -> float:
-    try:
-        return max(0.0, float(resp.headers.get("Retry-After", "")))
-    except ValueError:
-        return 2.0
+    """How long the provider says to wait, in seconds.
+
+    Tries every spelling before falling back, because the fallback (2s) is
+    usually wrong in the expensive direction: a member that actually needs 21
+    seconds gets asked again after 2, fails, and is benched.
+    """
+    for header in ("Retry-After", "X-RateLimit-Reset-Requests", "X-RateLimit-Reset-Tokens"):
+        raw = resp.headers.get(header, "").strip()
+        if not raw:
+            continue
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+        parsed = _parse_duration(raw)
+        if parsed is not None:
+            return max(0.0, parsed)
+        try:
+            when = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            continue
+        if when is not None:
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            return max(0.0, (when - datetime.now(UTC)).total_seconds())
+    return 2.0
 
 
 def _retryable(exc: Exception) -> bool:

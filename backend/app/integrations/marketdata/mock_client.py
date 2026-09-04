@@ -57,6 +57,14 @@ CURVES: dict[str, tuple[float, float, float, str]] = {
     "XEQT.TO": (20.0, 0.00040, 0.03, "CAD"),
     "ZAG.TO": (15.0, 0.00007, 0.01, "CAD"),
     "USDCAD=X": (1.30, 0.00002, 0.005, "CAD"),
+    # Factor proxies (app.analytics.factor_risk). Present so the mock can serve
+    # a risk decomposition at all — drifts and amplitudes are shaped after the
+    # real instruments (bonds barely drift, commodities swing hardest) rather
+    # than copied from them.
+    "IEF": (95.0, 0.00006, 0.012, "USD"),
+    "DBC": (18.0, 0.00015, 0.045, "USD"),
+    "HYG": (78.0, 0.00020, 0.018, "USD"),
+    "LQD": (110.0, 0.00010, 0.014, "USD"),
 }
 
 

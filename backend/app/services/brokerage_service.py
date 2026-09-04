@@ -27,6 +27,7 @@ from app.core.config import settings
 from app.core.crypto import TokenCipher
 from app.core.logging import get_logger
 from app.db.models import BrokerageConnection, ProposedOrder
+from app.domain.book_value import next_book_value_cad_cents
 from app.domain.enums import BrokerageConnectionStatus, OrderSide, ProposedOrderStatus
 from app.integrations.snaptrade.gateway import (
     OrderAction,
@@ -68,7 +69,20 @@ def _combine(existing: SnapTradePosition | None, incoming: SnapTradePosition) ->
     avg_cost_cents = round(
         (existing.avg_cost_cents * existing.qty + incoming.avg_cost_cents * incoming.qty) / qty
     )
-    return replace(existing, qty=qty, avg_cost_cents=avg_cost_cents)
+    # Market values add — but only when both sides reported one. A partial sum
+    # would understate the position by whichever account stayed silent, which is
+    # worse than falling back to market data for the whole thing.
+    market_value_cents = (
+        existing.market_value_cents + incoming.market_value_cents
+        if existing.market_value_cents is not None and incoming.market_value_cents is not None
+        else None
+    )
+    return replace(
+        existing,
+        qty=qty,
+        avg_cost_cents=avg_cost_cents,
+        market_value_cents=market_value_cents,
+    )
 
 
 class BrokerageService:
@@ -218,6 +232,34 @@ class BrokerageService:
         await self.user_settings.clear_snaptrade_registration(user_id)
         await self.session.commit()
 
+    async def resync_after_fill(self, user_id: uuid.UUID) -> bool:
+        """Re-mirror positions once the user has marked a trade done.
+
+        For a linked account the app is a mirror, not a ledger: whatever the
+        broker reports is what the user holds. ``apply_fill`` moves the local
+        numbers so the screen reacts immediately, but its arithmetic is an
+        estimate -- it guesses the fill price, and it can only guess the cost
+        basis. Pulling the broker's own positions right afterwards replaces
+        that estimate with the truth instead of letting the two drift apart
+        until the user happens to press Sync.
+
+        If the broker has not booked the trade yet, its answer is still the
+        honest one: the account really does not show the trade yet, and the
+        next sync will pick it up.
+
+        Returns True when the broker's numbers were applied. Never raises --
+        the fill itself is already committed, and a sync that could not run is
+        not a reason to tell the user their trade failed.
+        """
+        if not await self.connections.list_for_user(user_id):
+            return False
+        try:
+            await self.sync_positions(user_id)
+            return True
+        except (ValidationFailed, SnapTradeError) as exc:
+            logger.warning("Post-fill position sync failed for user %s: %s", user_id, exc)
+            return False
+
     # --- position sync ---
     async def sync_positions(self, user_id: uuid.UUID) -> BrokerageSyncOut:
         """Mirror broker positions into ``Holding``. The broker is authoritative.
@@ -239,6 +281,12 @@ class BrokerageService:
             raise ValidationFailed(f"Sync failed: {exc}") from exc
         by_account = {a.account_id: a for a in accounts}
 
+        # Refresh the rate before converting anything with it. `sync_bars`
+        # always covers the FX symbol, so an empty symbol list is enough — and
+        # on a first-ever sync it is what stops a USD position being booked at
+        # par, which a book value would then carry forever.
+        await self.invest.market_data.sync_bars([], refresh_today=True)
+        await self.session.commit()
         fx = await self.invest.market_data.latest_fx_rate() or 1.0
         # Positions accumulate across accounts before anything is written:
         # ``Holding`` is unique on (user, symbol), so writing per account would
@@ -291,7 +339,28 @@ class BrokerageService:
             connection.status = BrokerageConnectionStatus.ACTIVE
             connection.last_synced_at = datetime.now(UTC)
 
+        valued_at = datetime.now(UTC)
+        # Read the rows as they were before this sync overwrites them: the CAD
+        # book rolls forward from the previous cost, and the previous cost is
+        # about to be replaced.
+        before = {h.symbol.upper(): h for h in await self.holdings.list_for_user(user_id)}
+        # Whether this account has ever been mirrored. On the first sync every
+        # position already existed, so no rate we apply today is the rate its
+        # shares were bought at. Afterwards, a symbol appearing for the first
+        # time is a position opened since the last sync — bought at a rate we
+        # can read, so its book is exact.
+        first_ever = not any(h.is_synced for h in before.values())
         for symbol, position in merged.items():
+            existing = before.get(symbol)
+            rate = fx if position.currency.upper() == "USD" else 1.0
+            book_cad = next_book_value_cad_cents(
+                previous_cad_cents=existing.book_value_cad_cents if existing else None,
+                previous_native_cost_cents=(
+                    round(existing.avg_cost_cents * existing.qty) if existing else 0
+                ),
+                native_cost_cents=round(position.avg_cost_cents * position.qty),
+                fx_rate=rate,
+            )
             await self.holdings.upsert(
                 user_id=user_id,
                 symbol=symbol,
@@ -300,6 +369,16 @@ class BrokerageService:
                 currency=position.currency,
                 name=position.name,
                 is_synced=True,
+                # The broker's own valuation, in the position's currency. This
+                # is the figure on the user's brokerage screen; keeping it is
+                # what lets the portfolio agree with it instead of re-deriving
+                # a near-miss from cached closes and our own FX rate.
+                broker_value_cents=position.market_value_cents,
+                broker_valued_at=valued_at if position.market_value_cents is not None else None,
+                book_value_cad_cents=book_cad,
+                book_value_estimated=(
+                    first_ever or (existing.book_value_estimated if existing is not None else False)
+                ),
             )
 
         removed = 0
@@ -318,7 +397,12 @@ class BrokerageService:
         # unrelated market-data sync runs, which reads to the user as the
         # holding never having arrived.
         if merged:
-            await self.invest.market_data.sync_bars(sorted(merged))
+            # `refresh_today` because this runs when the user pressed Sync. The
+            # cache is right to trust a settled close; it is wrong to trust
+            # today's, which moves all session. Without this the first sync of
+            # the day pinned every price until tomorrow, so pressing Sync again
+            # returned the same numbers however far the market had moved.
+            await self.invest.market_data.sync_bars(sorted(merged), refresh_today=True)
             await self.session.commit()
 
         # The cached portfolio review describes the holdings as they were before
@@ -341,7 +425,7 @@ class BrokerageService:
         ``status_detail`` rather than being retried automatically: a retry loop
         against a broker risks duplicate fills.
         """
-        order = await self.proposals.get_for_user(user_id, order_id)
+        order = await self.proposals.get_for_user(user_id, order_id, for_update=True)
         if order is None:
             raise NotFound("Proposed order not found.")
         if order.status != ProposedOrderStatus.PROPOSED:
@@ -365,6 +449,25 @@ class BrokerageService:
                 "place it here, or buy the dollar amount at your broker and mark "
                 "it executed by hand."
             )
+
+        # Never route a sell larger than the position. `apply_fill` already
+        # refuses to book one, but that runs on settlement — after the order
+        # reached the broker. The check that matters is the one before the
+        # request goes out, because an order placed cannot be unplaced.
+        #
+        # Deliberately a refusal rather than a silent downsize: the quantity
+        # came from a plan the user read and approved, and quietly selling a
+        # different amount than the one they said yes to is its own failure.
+        if order.side == OrderSide.SELL:
+            holding = await self.holdings.get(user_id, order.symbol)
+            owned = holding.qty if holding else 0.0
+            if owned < order.qty - 1e-9:
+                return await self._fail(
+                    order,
+                    f"Your records show {owned:g} shares of {order.symbol}, fewer than the "
+                    f"{order.qty:g} this order sells. Tap Sync to refresh positions from "
+                    "your broker, then re-run the plan.",
+                )
 
         try:
             symbol = await self.gateway.resolve_symbol(
@@ -426,7 +529,7 @@ class BrokerageService:
 
     async def refresh_order(self, user_id: uuid.UUID, order_id: uuid.UUID) -> ProposedOrderOut:
         """Poll the broker for a submitted order and settle it if it filled."""
-        order = await self.proposals.get_for_user(user_id, order_id)
+        order = await self.proposals.get_for_user(user_id, order_id, for_update=True)
         if order is None:
             raise NotFound("Proposed order not found.")
         if order.status != ProposedOrderStatus.SUBMITTED or not order.broker_order_id:

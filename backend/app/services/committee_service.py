@@ -13,24 +13,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.committee import rules_only, run_committee
 from app.ai.llm.base import LLMProvider
+from app.ai.llm.budget import llm_budget
 from app.analytics.indicators import compute_indicators
 from app.core.config import settings
 from app.integrations.marketdata.provider import MarketDataError, MarketDataProvider
 from app.repositories.committee import AnalysisSessionRepository
 from app.schemas.committee import AgentTakeOut, CommitteeResult, SessionSummary
+from app.services.autotrader_service import rules_verdict
 from app.services.errors import NotFound, ValidationFailed
+from app.services.market_context_service import MarketContextService
 from app.services.market_data_service import MarketDataService
 
 
 class CommitteeService:
     def __init__(
-        self, session: AsyncSession, provider: MarketDataProvider, llm: LLMProvider
+        self,
+        session: AsyncSession,
+        provider: MarketDataProvider,
+        llm: LLMProvider,
+        context: MarketContextService | None = None,
     ) -> None:
         self.session = session
         self.provider = provider
         self.llm = llm
         self.market_data = MarketDataService(session, provider)
         self.repo = AnalysisSessionRepository(session)
+        # Optional keyword so every existing construction keeps working.
+        self.context = context
 
     async def analyze(self, user_id: uuid.UUID, symbol: str) -> CommitteeResult:
         sym = symbol.strip().upper()
@@ -55,8 +64,24 @@ class CommitteeService:
             ) from exc
 
         if settings.ai_available and await self.llm.is_available():
-            result = await run_committee(sym, quote_d, ind, self.llm)
+            # One ticker, user-initiated: the cheapest place research can run,
+            # and the one where a headline is most likely to matter.
+            market = await self.context.context([sym]) if self.context is not None else None
+            with llm_budget(
+                wait=settings.llm_wait_analyze_seconds,
+                max_pass_sleep=settings.llm_max_pass_sleep_seconds,
+                max_output_tokens=settings.llm_committee_max_tokens,
+            ):
+                result = await run_committee(
+                    sym,
+                    quote_d,
+                    ind,
+                    self.llm,
+                    rules=rules_verdict(ind, held=False),
+                    market=market,
+                )
         else:
+            # Offline stays free and transparent — no news fetched, none needed.
             result = rules_only(sym, quote_d, ind)
 
         row = await self.repo.add(
@@ -105,5 +130,9 @@ class CommitteeService:
             source=row.source,
             agents=[AgentTakeOut(**a) for a in p.get("agents", [])],
             indicators=p.get("indicators", {}),
+            # Sessions recorded before the research layer existed have neither
+            # key; the defaults are what they always effectively meant.
+            news_weight=p.get("news_weight", "absent"),
+            context=p.get("context"),
             created_at=row.created_at.isoformat(),
         )

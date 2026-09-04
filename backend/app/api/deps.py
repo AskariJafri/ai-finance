@@ -23,7 +23,9 @@ from app.core.crypto import get_cipher
 from app.db.models import User
 from app.db.session import get_session
 from app.integrations.marketdata.factory import get_market_data_provider
+from app.integrations.news.factory import get_news_provider
 from app.integrations.snaptrade.factory import get_snaptrade_gateway
+from app.integrations.websearch.factory import get_websearch_provider
 from app.services.advice_service import AdviceService
 from app.services.auth_service import AuthService
 from app.services.autotrader_service import AutoTraderService
@@ -37,6 +39,7 @@ from app.services.deploy_service import DeployService
 from app.services.errors import InvalidToken
 from app.services.invest_insight_service import InvestInsightService
 from app.services.invest_service import InvestService
+from app.services.market_context_service import MarketContextService
 from app.services.paper_broker_service import PaperBrokerService
 from app.services.plaid_service import PlaidService
 from app.services.portfolio_actions_service import PortfolioActionsService
@@ -102,16 +105,37 @@ def get_watchlist_service(session: SessionDep) -> WatchlistService:
     return WatchlistService(session, get_market_data_provider())
 
 
+def get_market_context_service(session: SessionDep) -> MarketContextService:
+    """The research layer. Built per request like every other service; the
+    providers behind it are cached factories."""
+    return MarketContextService(session, get_news_provider(), get_websearch_provider())
+
+
 def get_committee_service(session: SessionDep) -> CommitteeService:
-    return CommitteeService(session, get_market_data_provider(), get_advice_llm_provider())
+    return CommitteeService(
+        session,
+        get_market_data_provider(),
+        get_advice_llm_provider(),
+        get_market_context_service(session),
+    )
 
 
 def get_deploy_service(session: SessionDep) -> DeployService:
-    return DeployService(session, get_market_data_provider(), get_advice_llm_provider())
+    return DeployService(
+        session,
+        get_market_data_provider(),
+        get_advice_llm_provider(),
+        get_market_context_service(session),
+    )
 
 
 def get_portfolio_actions_service(session: SessionDep) -> PortfolioActionsService:
-    return PortfolioActionsService(session, get_market_data_provider(), get_advice_llm_provider())
+    return PortfolioActionsService(
+        session,
+        get_market_data_provider(),
+        get_advice_llm_provider(),
+        get_market_context_service(session),
+    )
 
 
 def get_paper_broker_service(session: SessionDep) -> PaperBrokerService:
@@ -119,7 +143,9 @@ def get_paper_broker_service(session: SessionDep) -> PaperBrokerService:
 
 
 def get_autotrader_service(session: SessionDep) -> AutoTraderService:
-    return AutoTraderService(session, get_market_data_provider())
+    return AutoTraderService(
+        session, get_market_data_provider(), get_market_context_service(session)
+    )
 
 
 def get_brokerage_service(

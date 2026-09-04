@@ -429,7 +429,13 @@ async def test_an_ai_sell_is_never_redeployed_into_a_rules_only_buy(seeded_sessi
     Free-tier capacity comes and goes mid-plan, so one ticker gets a real
     committee and the next falls back to rules. Selling what the committee
     scrutinized to buy what only the rules saw is a switch justified by the
-    weaker of the two signals — the proceeds stay in cash instead.
+    weaker of the two signals — those proceeds stay in cash instead.
+
+    The restriction is on the money, not on the existence of a buy. Cash on
+    hand, and what a rule-driven trim raises, may still be invested; only what
+    a judged sell raised is held back. Enforcing it by deleting every
+    rules-sourced buy instead meant a half-reachable model produced a plan that
+    only ever sold — see ``test_actions_buy_side.py``.
     """
 
     class HalfUpLLM(ScriptedLLM):
@@ -446,8 +452,12 @@ async def test_an_ai_sell_is_never_redeployed_into_a_rules_only_buy(seeded_sessi
     svc = PortfolioActionsService(seeded_session, FakeProvider(), HalfUpLLM({}))
     plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=3))
 
-    assert [a.symbol for a in plan.actions if a.side == "sell"] == ["ZAG.TO"]
-    assert [a for a in plan.actions if a.side == "buy"] == []
+    # ZAG was sold on a committee verdict; XEQT is trimmed by the concentration
+    # rule, which exists precisely to redeploy.
+    judged_sell = sum(a.amount for a in plan.actions if a.side == "sell" and a.symbol == "ZAG.TO")
+    assert judged_sell > 0
+    # Every cent of it survives as cash: the buys were funded from elsewhere.
+    assert plan.cash_after >= judged_sell - 0.01
     assert "stays in cash" in plan.note
     assert "only partly reachable" in plan.note
 

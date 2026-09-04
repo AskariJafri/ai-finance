@@ -17,7 +17,7 @@ import {
   useBrokerageConnections,
   usePortfolio,
 } from "../../api/hooks";
-import type { PortfolioAction, Sizing } from "../../api/types";
+import type { FactorPlan, PortfolioAction, Sizing } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { useTheme } from "../../theme";
@@ -218,6 +218,8 @@ export function ActionsScreen() {
               </Card>
             ) : null}
 
+            {result.factors ? <FactorCard factors={result.factors} /> : null}
+
             {result.holds.length ? (
               <Card>
                 <Text style={[styles.cardTitle, { color: theme.colors.text }]}>
@@ -267,6 +269,110 @@ export function ActionsScreen() {
         ) : null}
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+/**
+ * Where the plan's risk comes from — not how much of it there is.
+ *
+ * Weights already say what you own. This says what you are actually exposed
+ * to, which is a different list: three tickers can be one bet, and a Canadian
+ * holding US names carries a currency nobody chose. Breaches come first,
+ * because a limit that changed the plan is the reason an order is smaller than
+ * the committee's conviction would suggest.
+ */
+function FactorCard({ factors }: { factors: FactorPlan }) {
+  const theme = useTheme();
+  if (factors.reason) {
+    return (
+      <Card>
+        <Text style={[styles.cardTitle, { color: theme.colors.text }]}>Risk factors</Text>
+        <Text style={[styles.note, { color: theme.colors.textMuted }]}>{factors.reason}</Text>
+      </Card>
+    );
+  }
+  // Sorted by how much of the risk each one carries: the first line is the
+  // answer to "what is this portfolio actually a bet on".
+  const shown = [...factors.factors]
+    .filter((f) => Math.abs(f.share_of_risk) >= 0.02 || Math.abs(f.projected_share_of_risk) >= 0.02)
+    .sort((a, b) => Math.abs(b.share_of_risk) - Math.abs(a.share_of_risk));
+
+  return (
+    <Card>
+      <Text style={[styles.cardTitle, { color: theme.colors.text }]}>Where the risk comes from</Text>
+
+      {factors.breaches.map((b) => (
+        <View
+          key={b.key}
+          style={[
+            styles.breach,
+            {
+              borderLeftColor: b.binding ? theme.colors.negative : theme.colors.textMuted,
+              backgroundColor: theme.colors.border,
+            },
+          ]}
+        >
+          <Text
+            style={{
+              color: b.binding ? theme.colors.negative : theme.colors.text,
+              fontSize: 12,
+              fontWeight: "700",
+            }}
+          >
+            {b.binding ? `${b.name} limit — plan cut back` : `${b.name} — over the limit`}
+          </Text>
+          <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 3 }}>
+            {b.message}
+          </Text>
+        </View>
+      ))}
+
+      {shown.map((f) => {
+        const moved = Math.abs(f.projected_exposure - f.exposure) >= 0.01;
+        return (
+          <View key={f.key} style={[styles.pick, { borderTopColor: theme.colors.border }]}>
+            <View style={styles.pickHead}>
+              <Text style={{ color: theme.colors.text, fontWeight: "600", fontSize: 14 }}>
+                {f.name}
+              </Text>
+              <Text style={{ color: theme.colors.text, fontWeight: "700" }}>
+                {f.exposure.toFixed(2)}
+                {moved ? (
+                  <Text style={{ color: theme.colors.textMuted, fontWeight: "400" }}>
+                    {` → ${f.projected_exposure.toFixed(2)}`}
+                  </Text>
+                ) : null}
+              </Text>
+            </View>
+            <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 3 }}>
+              {formatPercent(f.share_of_risk)} of risk
+              {f.duration_years !== null ? ` · ${f.duration_years.toFixed(1)} yrs duration` : ""}
+            </Text>
+          </View>
+        );
+      })}
+
+      {factors.idiosyncratic_share !== null ? (
+        <View style={[styles.pick, { borderTopColor: theme.colors.border }]}>
+          <View style={styles.pickHead}>
+            <Text style={{ color: theme.colors.text, fontWeight: "600", fontSize: 14 }}>
+              Single-name risk
+            </Text>
+            <Text style={{ color: theme.colors.text, fontWeight: "700" }}>
+              {formatPercent(factors.idiosyncratic_share)}
+            </Text>
+          </View>
+          <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 3 }}>
+            The part no factor explains — specific to the companies you hold.
+          </Text>
+        </View>
+      ) : null}
+
+      <Text style={[styles.hint, { color: theme.colors.textMuted }]}>
+        Exposure of 1.00 means moving one-for-one with that factor. These limits
+        can only ever make the app buy less; nothing here proposes a sale.
+      </Text>
+    </Card>
   );
 }
 
@@ -378,6 +484,7 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   segmentRow: { flexDirection: "row", gap: 8, marginTop: 10 },
+  breach: { borderLeftWidth: 3, paddingLeft: 10, paddingVertical: 8, marginTop: 10 },
   pick: { borderTopWidth: 1, paddingTop: 10, marginTop: 10 },
   pickHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   symbol: { fontSize: 15, fontWeight: "700" },

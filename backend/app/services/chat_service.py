@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm.base import LLMProvider
+from app.ai.llm.budget import llm_budget
 from app.ai.prompts import CHAT_SYSTEM, build_chat_prompt
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -155,17 +156,25 @@ class ChatService:
     ) -> tuple[str, str, str | None]:
         if settings.ai_available:
             try:
-                content = await self.llm.complete(
-                    build_chat_prompt(
-                        question=question,
-                        finance_context=finance_text,
-                        reference=glossary.render_reference(terms) if terms else None,
-                        history=history,
-                    ),
-                    system=CHAT_SYSTEM,
-                    # Warmer than advice: this is conversation, not a report.
-                    temperature=0.5,
-                )
+                # The tightest budget in the app: someone is watching a typing
+                # indicator, so a short pause beats an offline message but a
+                # long one does not.
+                with llm_budget(
+                    wait=settings.llm_wait_chat_seconds,
+                    max_pass_sleep=settings.llm_chat_pass_sleep_seconds,
+                    max_output_tokens=settings.llm_chat_max_tokens,
+                ):
+                    content = await self.llm.complete(
+                        build_chat_prompt(
+                            question=question,
+                            finance_context=finance_text,
+                            reference=glossary.render_reference(terms) if terms else None,
+                            history=history,
+                        ),
+                        system=CHAT_SYSTEM,
+                        # Warmer than advice: this is conversation, not a report.
+                        temperature=0.5,
+                    )
                 if content:
                     return content, "ai", getattr(self.llm, "model", None)
             except Exception as exc:  # degrade, never fail the request

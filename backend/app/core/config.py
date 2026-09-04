@@ -39,6 +39,11 @@ class LLMEndpoint(BaseModel):
     # would throttle the others for no reason.
     max_tokens: int | None = None
     max_concurrency: int | None = None
+    # Per-endpoint socket timeout. Load-bearing once the pool is long: the
+    # global 45s across ten members, each retried twice, outlives even the
+    # most generous client timeout, so a slow endpoint at the back of the
+    # queue can hang a request that had faster members available.
+    timeout: float | None = None
     # Extra body fields for this endpoint, merged into every request. Provider
     # quirks belong in configuration rather than in the client: Groq's gpt-oss
     # models take `reasoning_effort`, and on a token-per-minute budget that one
@@ -149,15 +154,97 @@ class Settings(BaseSettings):
     llm_fallbacks: Annotated[list[LLMEndpoint], NoDecode] = Field(default_factory=list)
     ai_enabled: bool = True
 
+    # How long each surface may spend waiting out a rate limit before it gives
+    # up and degrades. Paired with the mobile client's own timeout for that
+    # screen (mobile/src/api/hooks.ts) — a budget that outlives the client is
+    # spent producing an answer nobody receives. Actions 300s, Deploy 180s,
+    # the rest 60s, so each of these sits comfortably inside its pair.
+    llm_wait_actions_seconds: float = 150.0
+    # How much of the actions budget the holdings stage may spend before the
+    # candidate stage's reserved share begins. Holdings are judged first, so
+    # without a cap they take the whole allowance on a rate-limited endpoint
+    # and the shopping list is judged by nothing — which is how a plan ends up
+    # all sells. Stage 2 still inherits whatever stage 1 leaves unspent.
+    llm_held_budget_share: float = 0.6
+    llm_wait_plan_seconds: float = 110.0
+    llm_wait_analyze_seconds: float = 35.0
+    llm_wait_narrative_seconds: float = 20.0
+    llm_wait_chat_seconds: float = 12.0
+    # Longest single pause inside one of those budgets. Separate so that one
+    # endpoint's long cooldown cannot swallow a request that has other members
+    # still worth trying.
+    llm_max_pass_sleep_seconds: float = 25.0
+    llm_chat_pass_sleep_seconds: float = 5.0
+    # Per-surface output ceilings. Only ever lower the endpoint's own
+    # max_tokens — see _payload.
+    llm_categorizer_max_tokens: int = 200
+    llm_committee_max_tokens: int = 2400
+    llm_narrative_max_tokens: int = 1200
+    llm_chat_max_tokens: int = 900
+
+    # Held positions all face the committee, and that is the only uncapped
+    # fan-out in the app: a twenty-name portfolio was twenty metered requests
+    # in a single tap. The largest positions are judged by the model and the
+    # tail falls back to the pre-committed rules, which is the right way round.
+    max_held_judged: int = 12
+
     # --- Invest ---
     # Annualized risk-free rate used in Sharpe/Sortino; a stated assumption,
     # not fetched — see the risk_free_rate explainer.
     risk_free_rate: float = 0.04
+
+    # Factor limits applied to a proposed plan (app.analytics.factor_limits).
+    # These only ever decline to buy — none of them can size a sell — so the
+    # cost of one being set too tight is an idea not funded, not a trade the
+    # user did not want. Off means the factor block is still shown to the
+    # committee; only the deterministic overlay stops.
+    factor_limits_enabled: bool = True
+    # Total USD/CAD exposure. A Canadian holder of US-listed names carries this
+    # whether or not they chose it, and it does not show up in the weights.
+    factor_fx_ceiling: float = 0.70
+    # Most of the risk coming from one factor is the thing "I own eight names"
+    # is meant to prevent and does not.
+    factor_share_ceiling: float = 0.85
+    # Single-name risk no factor explains, as a share of total risk.
+    factor_idio_ceiling: float = 0.70
+    # Implied duration in years, from the IR factor. Wide, because the point is
+    # to catch a rates bet taken by accident, not to pick a target.
+    factor_duration_min: float = -2.0
+    factor_duration_max: float = 8.0
     # Market data comes from Yahoo (free, keyless, works from Canada, prices
     # TSX listings). Mock provider is used in tests.
     market_data_use_mock: bool = False
     mc_paths_default: int = 2000
     mc_paths_max: int = 5000
+
+    # --- Research (company news + macro web search) ---
+    # Finnhub fronts per-ticker company news (finnhub.io free tier, no card,
+    # 60 req/min). Coverage is strongest on US listings; a symbol it does not
+    # cover comes back as "no coverage", which is deliberately NOT read as
+    # "no bad news" — see app/analytics/decision_context.py.
+    finnhub_api_key: str = ""
+    finnhub_base_url: str = "https://finnhub.io/api/v1"
+    finnhub_timeout_seconds: float = 12.0
+    news_use_mock: bool = False
+
+    # Tavily fronts the macro/world read (tavily.com, ~1,000 free credits a
+    # month). One search a day for the whole application, shared by every user
+    # and every decision — see the macro_briefs table.
+    tavily_api_key: str = ""
+    tavily_base_url: str = "https://api.tavily.com"
+    tavily_timeout_seconds: float = 20.0
+    websearch_use_mock: bool = False
+
+    # Master switch. Off = every surface behaves exactly as it did before the
+    # research layer existed.
+    research_enabled: bool = True
+    news_lookback_days: int = 7
+    news_max_articles: int = 8
+    # How recent an event must be to move the auto-trader's guardrail. Older
+    # than this and the market has had time to price it.
+    news_event_fresh_days: int = 3
+    macro_brief_max_results: int = 8
+    news_retention_days: int = 30
 
     # --- CORS ---
     cors_origins: str = "*"
@@ -200,6 +287,16 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"{', '.join(insecure)} still set to the development default; "
                     f"generate real values before deploying to {self.environment}."
+                )
+            # Same reasoning as the secrets: the permissive default is there so
+            # local work needs no setup, which is exactly what makes it easy to
+            # carry into production unnoticed. A deployed API that answers any
+            # origin is a finding on its own, and the browser's same-origin
+            # policy is doing nothing for it.
+            if "*" in self.cors_origin_list:
+                raise ValueError(
+                    "CORS_ORIGINS is still the '*' development default; list the "
+                    f"origins that may call this API before deploying to {self.environment}."
                 )
         return self
 
@@ -284,6 +381,29 @@ class Settings(BaseSettings):
         degrades to the mock broker rather than erroring at order time.
         """
         return self.snaptrade_trading_enabled and not self.use_mock_snaptrade
+
+    @property
+    def use_mock_news(self) -> bool:
+        """Fall back to the mock client if explicitly requested or unconfigured."""
+        return self.news_use_mock or not self.finnhub_api_key
+
+    @property
+    def use_mock_websearch(self) -> bool:
+        """Fall back to the mock client if explicitly requested or unconfigured."""
+        return self.websearch_use_mock or not self.tavily_api_key
+
+    @property
+    def research_available(self) -> bool:
+        """Research runs only when enabled *and* at least one side is configured.
+
+        Either half is useful alone: company news with no macro read still
+        catches a guidance cut, and a macro read with no company news still
+        tells the committee what regime it is deciding in. Requiring both
+        would silently disable the layer for anyone who signed up for one.
+        """
+        if not self.research_enabled:
+            return False
+        return bool(self.finnhub_api_key) or bool(self.tavily_api_key)
 
 
 @lru_cache

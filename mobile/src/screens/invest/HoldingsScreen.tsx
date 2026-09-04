@@ -21,6 +21,7 @@ import {
 } from "../../api/hooks";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
+import { PnlText } from "../../components/PnlText";
 import { useTheme } from "../../theme";
 import { formatCurrency } from "../../utils/format";
 
@@ -141,6 +142,23 @@ export function HoldingsScreen() {
           <Text style={[styles.cardTitle, { color: theme.colors.text }]}>
             Your holdings
           </Text>
+          {portfolio.data?.account ? (
+            <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 2 }}>
+              Unrealized{" "}
+              <PnlText
+                amount={portfolio.data.account.unrealized_pl}
+                pct={portfolio.data.account.unrealized_pl_pct}
+                style={{ fontSize: 12 }}
+              />
+              {"  ·  day "}
+              <PnlText
+                amount={portfolio.data.account.day_pl}
+                pct={portfolio.data.account.day_pl_pct}
+                placeholder="n/a"
+                style={{ fontSize: 12 }}
+              />
+            </Text>
+          ) : null}
           {holdings.isLoading ? (
             <ActivityIndicator color={theme.colors.primary} style={{ marginTop: 12 }} />
           ) : (holdings.data ?? []).length === 0 ? (
@@ -171,20 +189,28 @@ export function HoldingsScreen() {
                         <Text style={{ color: theme.colors.text, fontWeight: "600" }}>
                           {formatCurrency(pos.market_value)}
                         </Text>
-                        <Text
-                          style={{
-                            color:
-                              pos.unrealized_pl >= 0
-                                ? theme.colors.positive
-                                : theme.colors.negative,
-                            fontSize: 12,
-                          }}
-                        >
-                          {pos.unrealized_pl >= 0 ? "+" : ""}
-                          {formatCurrency(pos.unrealized_pl)}
+                        <PnlText
+                          amount={pos.unrealized_pl}
+                          pct={pos.unrealized_pl_pct}
+                          style={{ fontSize: 12 }}
+                        />
+                        <Text style={{ color: theme.colors.textMuted, fontSize: 11 }}>
+                          day{" "}
+                          <PnlText
+                            amount={pos.day_pl}
+                            pct={pos.day_change_pct}
+                            style={{ fontSize: 11 }}
+                          />
                         </Text>
                       </>
-                    ) : null}
+                    ) : (
+                      // Priced rows come from /portfolio; a holding missing
+                      // there has no cached bars yet, so say that rather than
+                      // leaving a blank column the user reads as "$0".
+                      <Text style={{ color: theme.colors.textMuted, fontSize: 12 }}>
+                        No price yet
+                      </Text>
+                    )}
                   </View>
                   <Pressable
                     onPress={() =>

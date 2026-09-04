@@ -75,10 +75,23 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json" if public else None,
     )
 
+    # Wildcard and credentials must never ship together. Starlette does not
+    # send a literal "*" when credentials are allowed — it echoes whatever
+    # Origin asked, so `allow_origins=["*"]` answers a request from any site
+    # with `Allow-Origin: <that site>` and `Allow-Credentials: true`. Today the
+    # only auth is a Bearer header that a cross-origin page cannot read or
+    # attach, so nothing is exploitable through it; the day anyone adds a
+    # session cookie, it silently becomes the whole account.
+    #
+    # Credentials are not used, so the honest configuration is to say so, and
+    # to keep the wildcard usable for local work without it meaning anything
+    # more than it should.
+    allow_origins = settings.cors_origin_list
+    wildcard = "*" in allow_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_credentials=True,
+        allow_origins=allow_origins,
+        allow_credentials=not wildcard,
         allow_methods=["*"],
         allow_headers=["*"],
     )

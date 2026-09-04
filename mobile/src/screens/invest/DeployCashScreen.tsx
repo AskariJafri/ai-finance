@@ -28,6 +28,19 @@ const PRESETS = [500, 1000, 5000] as const;
 // on a small amount — whole shares mean a wide split just buys nothing.
 const POSITION_CHOICES = [2, 3, 4, 5] as const;
 
+/** How the plan was actually judged.
+ *
+ * Three states, not two: the server now derives this from the verdicts that
+ * came back rather than from an availability check made before any of them.
+ * A scan can legitimately get a model read on some tickers and fall back on
+ * others, and calling that "AI committee" overstated the work behind it.
+ */
+function sourceLabel(source: string): string {
+  if (source === "ai") return "AI committee";
+  if (source === "mixed") return "AI committee (some fell back to rules)";
+  return "rules only (AI offline)";
+}
+
 export function DeployCashScreen() {
   const theme = useTheme();
   const navigation = useNavigation<any>();
@@ -215,9 +228,9 @@ export function DeployCashScreen() {
                 <Row label="Stays in cash" value={formatCurrency(result.cash_remaining)} />
                 <Row
                   label="Considered"
-                  value={`${result.considered} ticker${result.considered === 1 ? "" : "s"} · ${
-                    result.source === "ai" ? "AI committee" : "rules only (AI offline)"
-                  }`}
+                  value={`${result.considered} ticker${result.considered === 1 ? "" : "s"} · ${sourceLabel(
+                    result.source,
+                  )}`}
                 />
               </View>
 

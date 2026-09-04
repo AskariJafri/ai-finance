@@ -311,6 +311,39 @@ class Holding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     # True when this row is mirrored from a linked brokerage account.
     is_synced: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # What the broker itself said this position was worth, in the position's
+    # own currency, and when it said so. The app otherwise re-derives value from
+    # cached daily closes at its own FX rate, which is two sources of drift away
+    # from the figure on the user's brokerage screen. Null for manual holdings
+    # and for synced rows written before this column existed.
+    broker_value_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    broker_valued_at: Mapped[datetime_type | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # What this position cost in CAD, fixed at the rate that applied when each
+    # lot was bought — a *book* value, which by definition stops moving.
+    #
+    # ``avg_cost_cents`` is per share in the listing's currency, so converting
+    # it for display used today's rate on both sides of the subtraction and the
+    # FX cancelled out: the app reported a USD return under a CAD label, while
+    # the brokerage statement reported the real CAD return including the
+    # currency move. For a Canadian holding US stocks those are different
+    # numbers, and neither the purchase-date rate nor a CAD book value was
+    # anywhere in the schema to reconcile them.
+    #
+    # Maintained incrementally on sync (a buy adds its cost at that day's rate,
+    # a sell reduces the book proportionally), so it is exact from the first
+    # trade after this column existed. NULL means the basis predates it and the
+    # CAD return is still an estimate — reported as such rather than implied.
+    book_value_cad_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # True when any part of that book was converted at a rate we *assumed*
+    # rather than one observed when the shares were bought — a position that
+    # already existed the first time it was synced, or a cost typed in by hand
+    # with no purchase date attached. The value still stops drifting, which is
+    # the point; but calling an assumption a book value would be the same
+    # mistake as the bug it replaces, so the row says which it is. Sticky: once
+    # part of a basis is assumed, adding to the position does not make it exact.
+    book_value_estimated: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
 class WatchlistItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -438,6 +471,62 @@ class PriceBar(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     date: Mapped[date_type] = mapped_column(Date, index=True)
     close: Mapped[float] = mapped_column(Float)
     adjustment: Mapped[str] = mapped_column(String(10), default="all")
+
+
+class NewsSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One day's company-news pull for one symbol.
+
+    Global market data — no user_id, exactly like ``price_bars``: the news
+    about AAPL is the same news for every user, and making it per-user would
+    multiply a metered API call by the user count.
+
+    One row per (symbol, day) with the articles in ``payload``, rather than a
+    row per article. The state that MUST be cached is "we asked and the
+    provider had nothing" — a row-per-article table cannot express it, and the
+    tickers that produce it (TSX listings, which the free tier barely covers)
+    are exactly the ones a wide scan would otherwise re-ask about on every
+    single run, forever.
+    """
+
+    __tablename__ = "news_snapshots"
+    __table_args__ = (UniqueConstraint("symbol", "as_of", name="uq_news_snapshots_symbol_as_of"),)
+
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    as_of: Mapped[date_type] = mapped_column(Date, index=True)
+    source: Mapped[str] = mapped_column(String(16), default="finnhub")
+    # covered | none | fund. "none" is a real, cacheable answer and is NEVER
+    # evidence of good news — the guardrail only fires on "covered". "error"
+    # is deliberately never stored: a transient 500 must not lock in a day of
+    # silence for a symbol.
+    coverage: Mapped[str] = mapped_column(String(12), default="covered")
+    article_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Comma-joined flag keys, denormalized so the auto-trader guardrail is a
+    # single column read rather than a JSON parse per symbol.
+    flags: Mapped[str] = mapped_column(String(200), default="")
+    worst_severity: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class MacroBriefCache(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """The daily world/market read, fetched ONCE for the whole application.
+
+    This row is the main cost control in the research layer: every user, every
+    surface and every ticker on a given day share it, so a 65-ticker scan
+    costs one web search at most and usually zero.
+
+    Named ``MacroBriefCache`` because ``MacroBrief`` is the analytics DTO in
+    app/analytics/decision_context.py; the two are deliberately distinct.
+    """
+
+    __tablename__ = "macro_briefs"
+    __table_args__ = (UniqueConstraint("as_of", "topic", name="uq_macro_briefs_as_of_topic"),)
+
+    as_of: Mapped[date_type] = mapped_column(Date, index=True)
+    topic: Mapped[str] = mapped_column(String(24), default="markets")
+    source: Mapped[str] = mapped_column(String(16), default="tavily")
+    regime: Mapped[str] = mapped_column(String(12), default="mixed")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class PortfolioTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):

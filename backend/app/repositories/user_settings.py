@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UserSettings
@@ -19,12 +20,33 @@ class UserSettingsRepository:
         return result.scalar_one_or_none()
 
     async def get_or_create(self, user_id: uuid.UUID) -> UserSettings:
+        """The settings row for a user, creating it on first use.
+
+        Read-then-insert is a race: this row is created lazily by whichever
+        request first needs it, so two concurrent ones both find nothing and
+        both insert. The unique index on ``user_id`` is what keeps the data
+        correct — but unhandled it surfaces as a 500 on a request that did
+        nothing wrong, and it fires on the pair of actions a user is most
+        likely to trigger together on a fresh account.
+
+        Losing that race is not an error: the row exists, which is all the
+        caller wanted. The insert runs in a SAVEPOINT so the failure rolls back
+        only itself and leaves the caller's transaction usable.
+        """
         row = await self.get_for_user(user_id)
-        if row is None:
-            row = UserSettings(user_id=user_id)
-            self.session.add(row)
-            await self.session.flush()
-        return row
+        if row is not None:
+            return row
+        try:
+            async with self.session.begin_nested():
+                row = UserSettings(user_id=user_id)
+                self.session.add(row)
+                await self.session.flush()
+            return row
+        except IntegrityError:
+            row = await self.get_for_user(user_id)
+            if row is None:
+                raise  # a different constraint — not this race
+            return row
 
     async def set_income_override(self, user_id: uuid.UUID, cents: int | None) -> UserSettings:
         row = await self.get_or_create(user_id)

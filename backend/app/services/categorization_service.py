@@ -62,6 +62,19 @@ class CategorizationService:
         self._by_slug: dict[str, Category] | None = None
         self._by_id: dict[uuid.UUID, Category] | None = None
         self._slugs: list[str] | None = None
+        # Merchant key -> the AI's answer, for this request only.
+        #
+        # The AI branch is one metered request per transaction, and a sync is
+        # mostly repeats: two Starbucks charges in one batch used to be two
+        # requests. On a free tier metered at ~50 requests a DAY, a 60-row sync
+        # could spend the whole allowance before the user opened Invest once —
+        # which is what made the AI look "offline" by lunchtime.
+        #
+        # Request-scoped because the service is built per request
+        # (api/deps.py get_categorization_service), so it is bounded by one
+        # batch and needs no eviction. It is not a cache of AI output across
+        # requests: the next sync asks again.
+        self._ai_memo: dict[str, tuple[str | None, float]] = {}
 
     async def _load(self, user_id: uuid.UUID) -> None:
         if self._rules is None:
@@ -86,6 +99,9 @@ class CategorizationService:
         self._by_slug = None
         self._by_id = None
         self._slugs = None
+        # The memo is keyed on the merchant, but the *answer* is a slug from
+        # the category set that just changed — so it goes with the rest.
+        self._ai_memo = {}
 
     @staticmethod
     def _is_plaid_transfer(primary: str | None, detailed: str | None) -> bool:
@@ -186,13 +202,24 @@ class CategorizationService:
                     is_transfer=self._is_transfer_category(rule.category_id),
                 )
 
-        # 4. AI fallback.
-        slug, confidence = await self.ai.categorize(
-            description=description,
-            merchant_name=merchant_name,
-            category_slugs=self._slugs,
-            category_names=self.available_for_prompt(),
-        )
+        # 4. AI fallback, memoized per merchant for the life of this request.
+        #
+        # The miss is remembered too. An unrecognizable merchant returns
+        # (None, 0.0), and without memoizing that, the one payee the model
+        # cannot place would be re-asked on every row it appears in — the worst
+        # case rather than the best one.
+        memo_key = merchant_key or desc_key
+        if memo_key and memo_key in self._ai_memo:
+            slug, confidence = self._ai_memo[memo_key]
+        else:
+            slug, confidence = await self.ai.categorize(
+                description=description,
+                merchant_name=merchant_name,
+                category_slugs=self._slugs,
+                category_names=self.available_for_prompt(),
+            )
+            if memo_key:
+                self._ai_memo[memo_key] = (slug, confidence)
         if slug and slug in self._by_slug and slug != "uncategorized":
             chosen = self._by_slug[slug]
             return CategorizationResult(

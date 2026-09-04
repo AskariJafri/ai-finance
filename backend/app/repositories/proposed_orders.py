@@ -13,12 +13,28 @@ class ProposedOrderRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def get_for_user(self, user_id: uuid.UUID, order_id: uuid.UUID) -> ProposedOrder | None:
-        result = await self.session.execute(
-            select(ProposedOrder).where(
-                ProposedOrder.id == order_id, ProposedOrder.user_id == user_id
-            )
+    async def get_for_user(
+        self, user_id: uuid.UUID, order_id: uuid.UUID, *, for_update: bool = False
+    ) -> ProposedOrder | None:
+        """One order, scoped to its owner.
+
+        ``for_update`` takes a row lock for the rest of the transaction, and
+        every caller that goes on to *act* on the order must use it. Reading the
+        status and then acting on it is a check followed by a use, and without
+        the lock two requests can pass the same check: a double-tapped Approve
+        button, or a retry after a slow response, places the trade twice. The
+        lock makes the second request wait and then find the status it expects
+        to be exclusive already changed.
+
+        SQLite has no row locks and ignores the clause; the tests run there and
+        the deployment runs Postgres, which is where it matters.
+        """
+        stmt = select(ProposedOrder).where(
+            ProposedOrder.id == order_id, ProposedOrder.user_id == user_id
         )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
     async def list_for_user(

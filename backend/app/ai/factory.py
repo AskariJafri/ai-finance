@@ -9,6 +9,9 @@ from app.ai.llm.base import LLMProvider
 from app.ai.llm.openai_compat import OpenAICompatProvider
 from app.ai.llm.pool import LLMPool
 from app.core.config import settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @lru_cache
@@ -25,12 +28,24 @@ def get_llm_provider() -> LLMProvider:
             base_url=endpoint.base_url,
             model=endpoint.model,
             api_key=endpoint.api_key,
+            timeout=endpoint.timeout,
             max_tokens=endpoint.max_tokens,
             max_concurrency=endpoint.max_concurrency,
             extra_body=endpoint.extra_body,
+            label=endpoint.display(),
         )
+        # A fallback with no key is not a fallback. Left in, it declines on
+        # every single call and is benched on every single pass — pure noise in
+        # the logs and one wasted position in the preference order, which
+        # matters once the ladder is ten deep.
         for endpoint in settings.llm_fallbacks
+        if endpoint.api_key
     ]
+    logger.info(
+        "LLM pool: %d endpoint(s) — %s",
+        len(members),
+        ", ".join(getattr(m, "label", "?") for m in members),
+    )
     return LLMPool(members)
 
 

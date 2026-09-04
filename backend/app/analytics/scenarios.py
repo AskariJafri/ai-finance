@@ -1,9 +1,17 @@
 """Global stress-scenario library, applied to the current portfolio.
 
 Each scenario's shocks are HARDCODED from the historical record (sources in
-comments) — no model, no AI. Application is first-order: equity positions are
-shocked by equity_shock * beta_i, bond positions by bond_shock. Recovery
-figures describe the INDEX's historical recovery, never the user's portfolio.
+comments) — no model, no AI. Equity positions are shocked by
+equity_shock * beta_i, bond positions by bond_shock, and any position held in a
+currency other than the reporting one additionally takes fx_shock.
+
+The market and FX legs COMPOUND — (1+market)(1+fx)-1 — rather than adding.
+A crash and a currency move are separate events applying to the same capital,
+and adding them overstates a joint move by the cross term (a -57% equity shock
+with a -15% FX shock is -63.5%, not -72%).
+
+Recovery figures describe the INDEX's historical recovery, never the user's
+portfolio.
 """
 
 from __future__ import annotations
@@ -170,10 +178,16 @@ SCENARIOS: tuple[Scenario, ...] = (
 
 def apply_scenario(
     scenario: Scenario,
-    positions: list[dict],  # {symbol, market_value (USD $), beta (float|None)}
+    positions: list[dict],  # {symbol, market_value, beta (float|None), currency}
+    reporting_currency: str = "CAD",
 ) -> dict:
-    """First-order portfolio impact: equity shocked by equity_shock*beta,
-    bonds by bond_shock. Returns per-position and total impacts in USD."""
+    """Portfolio impact: equity shocked by equity_shock*beta, bonds by
+    bond_shock, and foreign-currency positions additionally by fx_shock.
+
+    ``market_value`` is in the reporting currency; ``currency`` is the
+    position's own. Returns per-position and total impacts in that same
+    reporting currency.
+    """
     per_position = []
     total_value = 0.0
     total_impact = 0.0
@@ -181,12 +195,19 @@ def apply_scenario(
         value = float(p["market_value"])
         total_value += value
         if p["symbol"].upper() in BOND_ETFS:
-            shock = scenario.bond_shock
+            market_shock = scenario.bond_shock
         else:
             b = p.get("beta")
-            shock = scenario.equity_shock * (b if b is not None else 1.0)
+            market_shock = scenario.equity_shock * (b if b is not None else 1.0)
         # A long position cannot lose more than its value, however high its beta.
-        shock = max(shock, -1.0)
+        market_shock = max(market_shock, -1.0)
+
+        # Currency risk only exists where the position is not already in the
+        # currency the user is being reported in.
+        native = str(p.get("currency") or reporting_currency).upper()
+        fx = scenario.fx_shock if native != reporting_currency.upper() else 0.0
+        shock = max((1.0 + market_shock) * (1.0 + fx) - 1.0, -1.0)
+
         impact = value * shock
         total_impact += impact
         per_position.append(

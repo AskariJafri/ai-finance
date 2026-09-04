@@ -262,3 +262,106 @@ async def test_user_secret_is_encrypted_at_rest(client: AsyncClient, db_session)
     assert row is not None
     assert row.snaptrade_secret_encrypted
     assert "mock-secret" not in row.snaptrade_secret_encrypted
+
+
+@pytest.mark.asyncio
+async def test_marking_a_trade_done_re_reads_the_broker(client: AsyncClient):
+    """For a linked account the positions are the broker's, not our arithmetic.
+
+    ``apply_fill`` moves the local numbers so the screen reacts immediately, but
+    it is an estimate. Once the fill is recorded the broker is re-read, so what
+    the user sees is what the brokerage account actually holds -- the two can no
+    longer drift apart until someone remembers to press Sync.
+    """
+    headers = await _register(client, "authoritative@test.com")
+    await _link(client, headers)
+    await client.post(f"{PREFIX}/brokerage/sync", headers=headers)
+
+    holdings = (await client.get(f"{PREFIX}/invest/holdings", headers=headers)).json()
+    broker_qty = {h["symbol"]: h["qty"] for h in holdings}
+    assert broker_qty["VFV.TO"] == 42.0  # what the mock broker reports
+
+    accepted = await client.post(
+        f"{PREFIX}/invest/actions/accept",
+        headers=headers,
+        json={
+            "sizing": "dollars",
+            "orders": [
+                {
+                    "symbol": "VFV.TO",
+                    "side": "sell",
+                    "amount": 285.0,
+                    "price": 142.5,
+                    "reason": "Trim the core.",
+                }
+            ],
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    order = accepted.json()["orders"][0]
+
+    resp = await client.post(
+        f"{PREFIX}/invest/orders/proposed/{order['id']}/executed",
+        headers=headers,
+        json={"fill_price": 142.5},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "filled"
+
+    # The broker still reports 42 shares (it has not booked the trade), so the
+    # app reports 42 -- the honest answer, not the optimistic one.
+    after = (await client.get(f"{PREFIX}/invest/holdings", headers=headers)).json()
+    assert {h["symbol"]: h["qty"] for h in after} == broker_qty
+
+
+@pytest.mark.asyncio
+async def test_a_sell_larger_than_the_position_never_reaches_the_broker(
+    client: AsyncClient, live_trading
+):
+    """The checklist is client-supplied; the broker boundary is not.
+
+    ``apply_fill`` already refuses to book an over-sell, but it runs on
+    settlement — after the order has been placed. An order that cannot be
+    unplaced has to be stopped before it is sent, so this asserts the refusal
+    happens at approval and that nothing was routed.
+    """
+    headers = await _register(client, "oversell@test.com")
+    await _link(client, headers)
+    await client.put(
+        f"{PREFIX}/invest/holdings",
+        headers=headers,
+        json={"symbol": "AAPL", "qty": 2, "avg_cost": 150.0},
+    )
+
+    accepted = await client.post(
+        f"{PREFIX}/invest/actions/accept",
+        headers=headers,
+        json={
+            "sizing": "shares",
+            "orders": [
+                {
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "amount": 1500.0,
+                    "price": 150.0,
+                    "qty": 10,  # five times the position
+                    "reason": "Hand-rolled payload.",
+                }
+            ],
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    order = accepted.json()["orders"][0]
+
+    resp = await client.post(f"{PREFIX}/brokerage/orders/{order['id']}/approve", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert "fewer than" in body["status_detail"]
+    # Nothing was sent: a failed order carries no broker id.
+    assert not body["broker_order_id"]
+
+    # And the position is untouched.
+    portfolio = (await client.get(f"{PREFIX}/invest/portfolio", headers=headers)).json()
+    aapl = next(p for p in portfolio["positions"] if p["symbol"] == "AAPL")
+    assert aapl["qty"] == 2

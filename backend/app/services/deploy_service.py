@@ -31,8 +31,9 @@ from datetime import date, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.committee import run_committee_many
+from app.ai.committee import run_committee_many, source_of
 from app.ai.llm.base import LLMProvider
+from app.ai.llm.budget import llm_budget
 from app.analytics.indicators import Indicators, compute_indicators
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -52,9 +53,10 @@ from app.schemas.invest import (
     ProposalOut,
     Sizing,
 )
-from app.services.autotrader_service import DEFAULT_UNIVERSE, signal_for
+from app.services.autotrader_service import DEFAULT_UNIVERSE, rules_verdict, signal_for
 from app.services.errors import ValidationFailed
 from app.services.invest_service import order_out
+from app.services.market_context_service import MarketContextService, research_out
 from app.services.market_data_service import MarketDataService
 
 logger = get_logger(__name__)
@@ -121,11 +123,17 @@ _PASSED_PRIORITY = {"too-expensive": 0, "SKIP": 1, "HOLD": 1, "not-shortlisted":
 
 class DeployService:
     def __init__(
-        self, session: AsyncSession, provider: MarketDataProvider, llm: LLMProvider
+        self,
+        session: AsyncSession,
+        provider: MarketDataProvider,
+        llm: LLMProvider,
+        context: MarketContextService | None = None,
     ) -> None:
         self.session = session
         self.provider = provider
         self.llm = llm
+        # Optional keyword so every existing construction keeps working.
+        self.context = context
         self.market_data = MarketDataService(session, provider)
         self.holdings = HoldingRepository(session)
         self.watchlist = WatchlistRepository(session)
@@ -175,14 +183,40 @@ class DeployService:
             )
 
         use_ai = body.use_ai and settings.ai_available and await self._llm_ready()
-        results = await run_committee_many(
-            [(sym, quote, ind) for sym, quote, ind, _ in quoted], self.llm, use_ai=use_ai
-        )
-        source = "ai" if use_ai else "rules"
+
+        # Research runs here — after quoting, not after ranking. Quoting drops
+        # candidates as unpriced, and fetching news for a name we are about to
+        # discard is a metered call spent on nothing. This is the whole tiering:
+        # the pool above may be ~65 names; `quoted` is at most max_candidates.
+        market = None
+        if use_ai and self.context is not None:
+            market = await self.context.context([sym for sym, _, _, _ in quoted])
+            await self.session.commit()
+
+        # One deadline shared by the whole fan-out. Opened here rather than
+        # per call because the tickers run concurrently: a per-call allowance
+        # would let waves of them each wait the full amount, and the bound the
+        # user actually cares about is when the request returns.
+        with llm_budget(
+            wait=settings.llm_wait_plan_seconds,
+            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
+            max_output_tokens=settings.llm_committee_max_tokens,
+        ):
+            results = await run_committee_many(
+                [(sym, quote, ind) for sym, quote, ind, _ in quoted],
+                self.llm,
+                use_ai=use_ai,
+                rules={sym: rules_verdict(ind, held=False) for sym, _, ind, _ in quoted},
+                market=market,
+            )
+        # Derived from the verdicts that actually came back, not from the gate
+        # decided before any call was made — a scan whose calls all 429 must not
+        # report itself as an AI plan.
+        source = source_of(results)
 
         prices = {sym: price for sym, _, _, price in quoted}
         names = {sym: quote.get("name") for sym, quote, _, _ in quoted}
-        return self._size(
+        plan = self._size(
             body.amount,
             results,
             prices,
@@ -193,6 +227,11 @@ class DeployService:
             body.max_positions,
             body.sizing,
         )
+        # Attached here rather than threaded through _size/_size_by_dollars/
+        # _empty_plan: the research context is a property of the request, not
+        # of the sizing arithmetic.
+        plan.research = research_out(market)
+        return plan
 
     async def _candidate_pool(self, user_id: uuid.UUID) -> list[str]:
         """Watchlist first, then the whole scan universe. Anything already held
@@ -296,6 +335,27 @@ class DeployService:
         return quoted, unpriced
 
     async def _llm_ready(self) -> bool:
+        """Is it worth *attempting* the AI at all for this plan?
+
+        Deliberately optimistic. This used to ask "is anything up?" and one
+        False turned off the model for every ticker in the scan — so a single
+        unlucky probe produced a wholly rules-based plan even when four of five
+        endpoints were healthy.
+
+        It is now a floor, not a gate: `run_committee_many` already degrades
+        per ticker, and a member with a spent quota already declines in
+        microseconds without touching the network. So the only thing worth
+        checking is whether the AI is *provably* gone — every member benched or
+        known dry. Anything short of that is worth trying and letting the
+        per-ticker fallback handle.
+        """
+        live = getattr(self.llm, "live_member_count", None)
+        if callable(live):
+            try:
+                return live() > 0
+            except Exception as exc:  # noqa: BLE001 — never fail a plan on a probe
+                logger.warning("LLM liveness check failed, assuming up: %s", exc)
+                return True
         try:
             return await self.llm.is_available()
         except Exception as exc:  # noqa: BLE001 — unreachable model is not an error
@@ -677,9 +737,6 @@ class DeployService:
 
     # --- accepting (writes PROPOSED rows — never APPROVED) ---
     async def accept(self, user_id: uuid.UUID, body: DeployAcceptIn) -> ProposalOut:
-        # A new batch supersedes anything still open, same as the rebalancer —
-        # otherwise a stale checklist and a fresh one both look actionable.
-        await self.proposals.expire_open_proposals(user_id)
         batch_id = uuid.uuid4()
 
         # Dollar-sized orders carry the amount and no quantity: the amount is
@@ -710,6 +767,11 @@ class DeployService:
             )
             for o in body.orders
         ]
+        # Never supersede an open checklist without a batch to replace it with:
+        # expiring on an empty accept would clear orders the user is still
+        # working through. Same invariant as the rebalancer.
+        if orders:
+            await self.proposals.expire_open_proposals(user_id)
         await self.proposals.add_all(orders)
         await self.session.commit()
 

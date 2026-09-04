@@ -32,13 +32,23 @@ number. Nothing here may set APPROVED: ``propose`` persists nothing at all, and
 
 from __future__ import annotations
 
+import time
 import uuid
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.committee import HeldContext, run_committee_many
+from app.ai.committee import HeldContext, run_committee_many, source_of
 from app.ai.llm.base import LLMProvider
+from app.ai.llm.budget import llm_budget
+from app.analytics import factor_limits, factor_risk
+from app.analytics.decision_context import (
+    MacroBrief,
+    MarketContext,
+    PortfolioBrief,
+    SymbolNews,
+)
 from app.analytics.indicators import Indicators, compute_indicators
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -55,13 +65,18 @@ from app.schemas.invest import (
     ActionPlanIn,
     ActionPlanOut,
     DeployPassedOut,
+    FactorBreachOut,
+    FactorPlanOut,
+    PlanFactorOut,
     ProposalOut,
     Sizing,
 )
+from app.services.autotrader_service import rules_verdict
 from app.services.deploy_service import CONCENTRATION_CAP, DeployService
 from app.services.errors import ValidationFailed
 from app.services.invest_service import InvestService, order_out
-from app.services.market_data_service import MarketDataService
+from app.services.market_context_service import MarketContextService, research_out
+from app.services.market_data_service import FX_SYMBOL, MarketDataService
 
 logger = get_logger(__name__)
 
@@ -87,6 +102,41 @@ MAX_RESERVE_SHARE = 0.25
 # can fund at this size, and conviction decides who makes the cut.
 MEANINGFUL_TRADE_PCT = 0.03
 
+# Below this, a buy coming in under its slice is reconciliation rather than a
+# shortfall: allocations are rounded to cents individually, so the slices can
+# sum to a few cents more than the budget they were carved from, and the last
+# name absorbs it. Well under MIN_TRADE_CAD, so nothing that changes what the
+# user actually does can hide beneath it.
+FUNDING_SHORTFALL_CAD = 1.0
+
+# How much price history the factor regressions get. One year, matching the risk
+# screen's default window, so the exposures a plan is checked against are the
+# same ones the user can go and look at.
+FACTOR_WINDOW_DAYS = 365
+
+
+def _limits() -> factor_limits.Limits:
+    return factor_limits.Limits(
+        fx_ceiling=settings.factor_fx_ceiling,
+        share_ceiling=settings.factor_share_ceiling,
+        idio_ceiling=settings.factor_idio_ceiling,
+        duration_min=settings.factor_duration_min,
+        duration_max=settings.factor_duration_max,
+    )
+
+
+@dataclass
+class _Sized:
+    """What stage 3 produced. A dataclass rather than a tuple because the
+    factor overlay made it the fifth thing to unpack, and the fifth element of
+    a tuple is the one that gets bound to the wrong name."""
+
+    actions: list[ActionOut] = field(default_factory=list)
+    holds: list[ActionHoldOut] = field(default_factory=list)
+    cash_after: float = 0.0
+    unfunded: bool = False
+    factors: FactorPlanOut | None = None
+
 
 class PortfolioActionsService:
     def __init__(
@@ -94,10 +144,13 @@ class PortfolioActionsService:
         session: AsyncSession,
         provider: MarketDataProvider,
         llm: LLMProvider,
+        context: MarketContextService | None = None,
     ) -> None:
         self.session = session
         self.provider = provider
         self.llm = llm
+        # Optional keyword so every existing construction keeps working.
+        self.context = context
         self.market_data = MarketDataService(session, provider)
         self.holdings = HoldingRepository(session)
         self.proposals = ProposedOrderRepository(session)
@@ -105,7 +158,7 @@ class PortfolioActionsService:
         # Candidate ranking, quoting and the scan universe are the cash
         # planner's problem already solved; this composes it rather than
         # growing a second copy that drifts out of step.
-        self.deploy = DeployService(session, provider, llm)
+        self.deploy = DeployService(session, provider, llm, context)
 
     # --- planning (read-only: persists nothing) ---
     async def plan(self, user_id: uuid.UUID, body: ActionPlanIn) -> ActionPlanOut:
@@ -144,14 +197,81 @@ class PortfolioActionsService:
         passed: list[DeployPassedOut] = []
         use_ai = body.use_ai and settings.ai_available and await self.deploy._llm_ready()
 
-        held_results, held_prices, held_names = await self._judge_held(held, passed, use_ai)
-        candidates, considered = await self._judge_candidates(user_id, body, passed, use_ai)
+        # What KIND of risk this book already carries, before anything is judged.
+        # Fitted on the holdings alone so the seats see it from the first call;
+        # refitted below over the candidates too, because a projection can only
+        # compare a book to itself when everything in it was measured the same
+        # way. The seats get the picture; the overlay gets the arithmetic.
+        currencies = {p["symbol"]: p.get("currency") for p in portfolio.positions}
+        model = await self._fit_factors(currencies)
+        limits = _limits()
+        brief = factor_limits.brief(
+            model.project({s: held[s]["weight"] for s in held}) if model else None, limits
+        )
+
+        # One macro read for the whole plan. Both stages share it rather than
+        # each hitting the cache, and it is the same row every other user gets
+        # today — see MarketContextService.macro.
+        macro = None
+        if use_ai and self.context is not None:
+            macro = await self.context.macro()
+            await self.session.commit()
+
+        # Both stages append into one dict, the same way they already append
+        # into `passed`, so the response can report the research as a whole.
+        researched: dict[str, SymbolNews] = {}
+        # One request-wide allowance, but split rather than shared first-come.
+        #
+        # The two stages used to sit inside a single budget, and because
+        # holdings are judged first they spent it: waiting out a rate limit on
+        # a position left the shopping list with an expired deadline, so every
+        # candidate fell back to rules and the signal-quality rule below then
+        # declined to fund them. The plan that came back was sells and nothing
+        # else — not because there was nothing worth buying, but because the
+        # buy side was always the half that ran second.
+        #
+        # So stage 1 is capped at its share and stage 2 gets everything left
+        # over, floored at the share reserved for it. The total is unchanged;
+        # what changes is that the shopping list can no longer be starved by
+        # the stage in front of it.
+        total_wait = settings.llm_wait_actions_seconds
+        reserved = total_wait * (1.0 - settings.llm_held_budget_share)
+        started = time.monotonic()
+        with llm_budget(
+            wait=total_wait * settings.llm_held_budget_share,
+            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
+            max_output_tokens=settings.llm_committee_max_tokens,
+        ):
+            held_results, held_prices, held_names = await self._judge_held(
+                held, passed, use_ai, macro, researched, brief
+            )
+        with llm_budget(
+            wait=max(total_wait - (time.monotonic() - started), reserved),
+            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
+            max_output_tokens=settings.llm_committee_max_tokens,
+        ):
+            candidates, considered = await self._judge_candidates(
+                user_id, body, passed, use_ai, macro, researched, brief
+            )
         # Each verdict degrades on its own, so "the AI ran" is not a property of
         # the request — it is a count of which ones actually came back. Saying
         # "ai" over a plan that is mostly rules would overstate it.
         source = self._source([*held_results.values(), *candidates])
 
-        actions, holds, cash_after, unfunded = self._size(
+        # Refit over holdings and shortlist together. The overlay compares the
+        # book as it stands to the book the plan would leave, and that
+        # comparison is only meaningful when both sides were measured over one
+        # window — otherwise the change in window shows up as an effect of the
+        # trades. Costs one extra alignment over a handful of cached series.
+        if candidates:
+            model = (
+                await self._fit_factors(
+                    {**currencies, **{c["symbol"]: c.get("currency") for c in candidates}}
+                )
+                or model
+            )
+
+        sized = self._size(
             body=body,
             equity=equity,
             cash=cash,
@@ -161,7 +281,11 @@ class PortfolioActionsService:
             held_names=held_names,
             candidates=candidates,
             passed=passed,
+            model=model,
+            limits=limits,
         )
+        actions, holds = sized.actions, sized.holds
+        cash_after, unfunded = sized.cash_after, sized.unfunded
 
         return ActionPlanOut(
             as_of=date.today().isoformat(),
@@ -174,21 +298,91 @@ class PortfolioActionsService:
             passed=self.deploy._trim_passed(passed),
             considered=considered + len(held),
             source=source,
-            note=self._note(actions, holds, cash_after, body, unfunded),
+            note=self._note(actions, holds, cash_after, body, unfunded, sized.factors),
+            factors=sized.factors,
+            research=research_out(
+                MarketContext(as_of=date.today(), macro=macro, symbols=researched)
+                if (macro is not None or researched)
+                else None
+            ),
         )
+
+    # --- factor model ---
+    async def _fit_factors(
+        self, currency_by_symbol: dict[str, str | None]
+    ) -> factor_risk.FactorModel | None:
+        """Regress everything this plan might touch on the factor proxies.
+
+        Returns None whenever the fit cannot be trusted — too little history,
+        a missing proxy panel, a provider that failed. Nothing downstream
+        treats that as an error: the plan simply runs as it did before the
+        factor work existed, which is the right failure for a guardrail. The
+        alternative, enforcing limits computed from three months of one ETF,
+        would decline trades for a reason nobody could check.
+        """
+        symbols = [s for s in dict.fromkeys(currency_by_symbol) if s]
+        if not symbols:
+            return None
+        start = date.today() - timedelta(days=FACTOR_WINDOW_DAYS)
+        try:
+            _, returns, _ = await self.invest._aligned_returns(
+                symbols + list(factor_risk.PROXY_SYMBOLS), start
+            )
+            f_returns, unavailable = factor_risk.build_factor_returns(returns)
+            # Regress on what a CAD holder actually earns. Without this a
+            # US-listed name shows no USD/CAD loading at all — its own price
+            # series never contains the currency move — and the FX ceiling
+            # would be guarding a number that cannot rise.
+            asset_returns = factor_risk.to_reporting_currency(
+                {s: returns[s] for s in symbols if s in returns},
+                currency_by_symbol,
+                returns.get(FX_SYMBOL),
+            )
+            return factor_risk.fit_model(symbols, asset_returns, f_returns, unavailable)
+        except Exception as exc:  # noqa: BLE001 — a plan without factors is still a plan
+            logger.warning("Factor fit failed, planning without limits: %s", exc)
+            return None
 
     # --- stage 1: what you already own ---
     async def _judge_held(
-        self, held: dict[str, dict], passed: list[DeployPassedOut], use_ai: bool
+        self,
+        held: dict[str, dict],
+        passed: list[DeployPassedOut],
+        use_ai: bool,
+        macro: MacroBrief | None = None,
+        researched: dict[str, SymbolNews] | None = None,
+        brief: PortfolioBrief | None = None,
     ) -> tuple[dict[str, dict], dict[str, float], dict[str, str | None]]:
-        """Committee verdict on every held position.
+        """Committee verdict on the held positions, largest first.
 
-        Held positions are never shortlisted away: a plan that silently ignores
-        something you own is worse than no plan.
+        Held positions are never shortlisted *away* — a plan that silently
+        ignores something you own is worse than no plan — but they are the only
+        uncapped fan-out in the app, and one metered call each meant a
+        twenty-name portfolio spent twenty requests on a single tap, most of
+        them on positions too small to act on.
+
+        So the biggest positions get the model and the tail gets the same
+        pre-committed rules the auto-trader runs on, reported honestly rather
+        than dropped. Ordering by weight is what makes the cut defensible: the
+        money is judged, the rounding is not.
         """
-        symbols = list(held)
+        symbols = sorted(held, key=lambda s: held[s].get("weight", 0.0), reverse=True)
         if not symbols:
             return {}, {}, {}
+
+        if len(symbols) > settings.max_held_judged:
+            for symbol in symbols[settings.max_held_judged :]:
+                passed.append(
+                    DeployPassedOut(
+                        symbol=symbol,
+                        action="HOLD",
+                        reason=(
+                            "too small to spend an AI call on this run — judged on the "
+                            "pre-committed rules instead."
+                        ),
+                    )
+                )
+            symbols = symbols[: settings.max_held_judged]
 
         # Bars were synced by `plan` before the portfolio was valued.
         series = await self.market_data.get_close_series(symbols)
@@ -224,11 +418,32 @@ class PortfolioActionsService:
             for sym, _, _, _ in quoted
             if sym in held
         }
+        # Held positions ALWAYS get news. There are only ever a handful, and a
+        # fresh negative event on something you already own is the single
+        # highest-value case in this whole feature — it is the one the price
+        # series cannot warn you about in time.
+        market = None
+        if use_ai and self.context is not None:
+            by_symbol, stale = await self.context.for_symbols([s for s, _, _, _ in quoted])
+            await self.session.commit()
+            if researched is not None:
+                researched.update(by_symbol)
+            market = MarketContext(
+                as_of=date.today(),
+                macro=macro,
+                symbols=by_symbol,
+                stale=bool(stale),
+                stale_symbols=tuple(stale),
+            )
+
         results = await run_committee_many(
             [(sym, quote, ind) for sym, quote, ind, _ in quoted],
             self.llm,
             use_ai=use_ai,
             held=contexts,
+            rules={sym: rules_verdict(ind, held=True) for sym, _, ind, _ in quoted},
+            market=market,
+            portfolio=brief,
         )
         return (
             {r["symbol"]: r for r in results},
@@ -243,6 +458,9 @@ class PortfolioActionsService:
         body: ActionPlanIn,
         passed: list[DeployPassedOut],
         use_ai: bool,
+        macro: MacroBrief | None = None,
+        researched: dict[str, SymbolNews] | None = None,
+        brief: PortfolioBrief | None = None,
     ) -> tuple[list[dict], int]:
         """Rank the unheld universe for free, then spend calls on the top few."""
         if body.max_new_positions == 0:
@@ -265,8 +483,30 @@ class PortfolioActionsService:
         if not quoted:
             return [], len(pool)
 
+        # Shortlist only — `pool` above may be ~65 names, `quoted` is at most
+        # max_candidates. Fetching news for the pool is what this staging exists
+        # to avoid.
+        market = None
+        if use_ai and self.context is not None:
+            by_symbol, stale = await self.context.for_symbols([s for s, _, _, _ in quoted])
+            await self.session.commit()
+            if researched is not None:
+                researched.update(by_symbol)
+            market = MarketContext(
+                as_of=date.today(),
+                macro=macro,
+                symbols=by_symbol,
+                stale=bool(stale),
+                stale_symbols=tuple(stale),
+            )
+
         results = await run_committee_many(
-            [(sym, quote, ind) for sym, quote, ind, _ in quoted], self.llm, use_ai=use_ai
+            [(sym, quote, ind) for sym, quote, ind, _ in quoted],
+            self.llm,
+            use_ai=use_ai,
+            rules={sym: rules_verdict(ind, held=False) for sym, _, ind, _ in quoted},
+            market=market,
+            portfolio=brief,
         )
         prices = {sym: price for sym, _, _, price in quoted}
         names = {sym: quote.get("name") for sym, quote, _, _ in quoted}
@@ -288,7 +528,9 @@ class PortfolioActionsService:
         held_names: dict[str, str | None],
         candidates: list[dict],
         passed: list[DeployPassedOut],
-    ) -> tuple[list[ActionOut], list[ActionHoldOut], float, bool]:
+        model: factor_risk.FactorModel | None = None,
+        limits: factor_limits.Limits | None = None,
+    ) -> _Sized:
         sells: list[ActionOut] = []
         holds: list[ActionHoldOut] = []
         adds: list[dict] = []
@@ -296,6 +538,11 @@ class PortfolioActionsService:
         # Value freed by the sells, tracked per symbol so a name being trimmed
         # is never topped up in the same plan.
         trimmed: dict[str, float] = {}
+        # The subset of that raised by selling on a verdict the committee
+        # actually reached. Only these proceeds are restricted below — a
+        # concentration trim is the app's own rule firing, not a view the model
+        # took, and its stated reason is to redeploy.
+        ai_trimmed: dict[str, float] = {}
 
         # --- what the committee said about each holding ---
         for symbol, position in held.items():
@@ -338,6 +585,8 @@ class PortfolioActionsService:
                     )
                     if sell is not None:
                         trimmed[symbol] = sell.amount
+                        if str(result.get("source")) == "ai":
+                            ai_trimmed[symbol] = sell.amount
                         sells.append(sell)
                         continue
                     holds.append(
@@ -390,17 +639,21 @@ class PortfolioActionsService:
         # Never fund a buy on a weaker signal than the sell paying for it. When
         # the model answers for some tickers and not others — free-tier capacity
         # comes and goes mid-plan — the naive result is selling what the
-        # committee scrutinized to buy what only the rules saw. The proceeds sit
-        # in cash instead, which is a position; a switch justified by the weaker
-        # of two signals is not.
-        judged_by_ai = any(
-            str(held_results.get(sell.symbol, {}).get("source")) == "ai" for sell in sells
-        )
-        unfunded = False
-        if judged_by_ai:
-            kept = [a for a in adds if a.get("verdict_source") == "ai"]
-            unfunded = len(kept) < len(adds)
-            adds = kept
+        # committee scrutinized to buy what only the rules saw. A switch
+        # justified by the weaker of two signals is not a switch worth making.
+        #
+        # The rule is about the *swap*, though, and this used to enforce it by
+        # deleting every rules-sourced buy outright. That is a much wider claim:
+        # it says money you already had may not be invested either, because
+        # something unrelated was sold on a better signal. On a metered endpoint
+        # the candidate stage is the one that degrades, so the standing result
+        # was a plan that only ever sold.
+        #
+        # So the restriction now lands where the principle actually applies —
+        # the proceeds, not the buy. A rules-sourced buy may draw on cash on
+        # hand and on what a rules-driven sell raised; only the proceeds of a
+        # sell the committee itself judged are reserved for buys it also judged.
+        # With no sells at all, nothing is restricted and nothing changes.
 
         # --- concentration overlay ---
         # A name can be a fine investment and still be too much of the account,
@@ -463,7 +716,50 @@ class PortfolioActionsService:
         reserve = min(equity * CASH_FLOOR_PCT, budget * MAX_RESERVE_SHARE)
         spendable = max(0.0, budget - reserve)
 
-        purchases, unaffordable = self._allocate_buys(adds, spendable, equity, body.sizing)
+        # Everything except the proceeds of a committee-judged sell. This is the
+        # ceiling on what buys the committee did not judge may draw between
+        # them; each one is still sized by conviction inside it.
+        weak_ceiling = max(0.0, spendable - sum(ai_trimmed.values()))
+
+        purchases, unaffordable, unfunded = self._allocate_buys(
+            adds, spendable, equity, body.sizing, weak_ceiling=weak_ceiling
+        )
+
+        # --- factor overlay ---
+        # Last, and only over the buys. Everything above decided WHAT to own;
+        # this decides how much of the resulting book may sit on any one kind
+        # of risk. It runs after allocation rather than as another cap inside
+        # it because the limits are properties of the whole plan — you cannot
+        # tell whether a name breaches the equity share of risk by looking at
+        # that name.
+        purchases, cut, factor_plan = self._apply_factor_limits(
+            purchases,
+            held=held,
+            trimmed=trimmed,
+            equity=equity,
+            model=model,
+            limits=limits,
+            sizing=body.sizing,
+        )
+        for a in cut:
+            if a["symbol"] in held:
+                holds.append(
+                    ActionHoldOut(
+                        symbol=a["symbol"],
+                        weight=held[a["symbol"]]["weight"],
+                        confidence=a["confidence"],
+                        reason=a["reason"],
+                    )
+                )
+            else:
+                passed.append(
+                    DeployPassedOut(
+                        symbol=a["symbol"],
+                        action="factor-limit",
+                        confidence=a["confidence"],
+                        reason=a["reason"],
+                    )
+                )
         cash_after = budget - sum(p.amount for p in purchases)
 
         # A name that cannot be bought in whole shares is still a decision the
@@ -522,7 +818,187 @@ class PortfolioActionsService:
                 )
 
         # Sells first: the buys are funded by them.
-        return sells + purchases, holds, cash_after, unfunded
+        return _Sized(
+            actions=sells + purchases,
+            holds=holds,
+            cash_after=cash_after,
+            unfunded=unfunded,
+            factors=factor_plan,
+        )
+
+    def _apply_factor_limits(
+        self,
+        purchases: list[ActionOut],
+        *,
+        held: dict[str, dict],
+        trimmed: dict[str, float],
+        equity: float,
+        model: factor_risk.FactorModel | None,
+        limits: factor_limits.Limits | None,
+        sizing: Sizing,
+    ) -> tuple[list[ActionOut], list[dict], FactorPlanOut | None]:
+        """Cut the buys back to what the factor limits allow.
+
+        Returns the surviving orders, the ones cut to nothing (to be reported
+        rather than silently dropped — money left in cash is a decision), and
+        the factor block for the response.
+        """
+        if model is None:
+            return (
+                purchases,
+                [],
+                FactorPlanOut(
+                    reason=(
+                        "Not enough overlapping price history across your holdings and the "
+                        "factor proxies to measure what kind of risk you carry — tap Sync data."
+                    )
+                ),
+            )
+        limits = limits or _limits()
+
+        # The book the plan would leave behind, before any buying: sells have
+        # already been decided and their proceeds are what funds the buys.
+        positions = {
+            symbol: max(0.0, position["market_value"] - trimmed.get(symbol, 0.0))
+            for symbol, position in held.items()
+        }
+        by_symbol = {p.symbol: p for p in purchases}
+        result = factor_limits.constrain(
+            model,
+            equity=equity,
+            positions=positions,
+            buys={p.symbol: p.amount for p in purchases},
+            limits=limits,
+        )
+
+        # An enforcement pass that never checks whether the check ran would be
+        # the worst of both: silent when it mattered. `state_now` is None when
+        # the model priced too little of the book to speak for it.
+        if result.state_now is None:
+            return (
+                purchases,
+                [],
+                FactorPlanOut(
+                    reason=(
+                        "Too little of your portfolio has usable price history to break its "
+                        "risk into factors, so no factor limit was applied to this plan."
+                    )
+                ),
+            )
+
+        kept: list[ActionOut] = []
+        cut: list[dict] = []
+        binding = next((b.name for b in result.breaches if b.binding), None)
+        enforcing = settings.factor_limits_enabled
+        for symbol, amount in result.buys.items():
+            order = by_symbol[symbol]
+            # Report-only mode still measures and still explains; it just does
+            # not move anyone's money. Worth keeping as one flag rather than
+            # two code paths, so what ships is what was tested.
+            if not enforcing or amount >= order.amount - 0.005:
+                kept.append(order)
+                continue
+            resized = self._resize_buy(order, amount, equity=equity, sizing=sizing)
+            note = f" Sized down to stay inside the {binding} limit." if binding else ""
+            if resized is None:
+                cut.append(
+                    {
+                        "symbol": symbol,
+                        "confidence": order.confidence,
+                        "reason": (
+                            f"worth owning, but buying it would push this portfolio past the "
+                            f"{binding} limit, and what was left is too small to trade."
+                            if binding
+                            else "cut back by the factor limits to too small a trade to place."
+                        ),
+                    }
+                )
+                continue
+            kept.append(resized.model_copy(update={"reason": resized.reason + note}))
+
+        kept.sort(key=lambda p: p.amount, reverse=True)
+        return kept, cut, self._factor_plan(result, enforced=enforcing and result.enforced)
+
+    @staticmethod
+    def _resize_buy(
+        order: ActionOut, amount: float, *, equity: float, sizing: Sizing
+    ) -> ActionOut | None:
+        """The same buy, smaller. None when what is left is not worth placing."""
+        if sizing == "shares":
+            whole = float(int(amount / order.price)) if order.price else 0.0
+            if whole < 1:
+                return None
+            amount, qty = whole * order.price, whole
+        else:
+            qty = None
+        if amount < MIN_TRADE_CAD:
+            return None
+        amount = round(amount, 2)
+        current_value = order.current_weight * equity
+        return order.model_copy(
+            update={
+                "amount": amount,
+                "qty": qty,
+                "projected_weight": (
+                    round((current_value + amount) / equity, 4) if equity else 0.0
+                ),
+            }
+        )
+
+    @staticmethod
+    def _factor_plan(result: factor_limits.Constrained, *, enforced: bool) -> FactorPlanOut:
+        now, after = result.state_now, result.state_after
+        if now is None:
+            return FactorPlanOut(enforced=False)
+        after = after or now
+        return FactorPlanOut(
+            factors=[
+                PlanFactorOut(
+                    key=key,
+                    name=(
+                        factor_risk.FACTOR_BY_KEY[key].name
+                        if key in factor_risk.FACTOR_BY_KEY
+                        else key
+                    ),
+                    exposure=round(exposure, 4),
+                    projected_exposure=round(after.exposures.get(key, exposure), 4),
+                    share_of_risk=round(now.variance_share.get(key, 0.0), 4),
+                    projected_share_of_risk=round(after.variance_share.get(key, 0.0), 4),
+                    duration_years=(
+                        round(now.duration_years, 2)
+                        if key == "ir" and now.duration_years is not None
+                        else None
+                    ),
+                    projected_duration_years=(
+                        round(after.duration_years, 2)
+                        if key == "ir" and after.duration_years is not None
+                        else None
+                    ),
+                )
+                for key, exposure in now.exposures.items()
+            ],
+            idiosyncratic_share=round(now.idiosyncratic_share, 4),
+            projected_idiosyncratic_share=round(after.idiosyncratic_share, 4),
+            total_vol=round(now.total_vol, 4),
+            projected_total_vol=round(after.total_vol, 4),
+            breaches=[
+                FactorBreachOut(
+                    key=b.key,
+                    name=b.name,
+                    current=b.current,
+                    projected=b.projected,
+                    limit=b.limit,
+                    # A breach the app chose not to act on must not claim it
+                    # bound anything, or the plan would describe a cut it did
+                    # not make.
+                    binding=b.binding and enforced,
+                    unit=b.unit,
+                    message=b.message,
+                )
+                for b in result.breaches
+            ],
+            enforced=enforced,
+        )
 
     @staticmethod
     def _sell_action(
@@ -581,7 +1057,9 @@ class PortfolioActionsService:
         spendable: float,
         equity: float,
         sizing: Sizing = "dollars",
-    ) -> tuple[list[ActionOut], list[dict]]:
+        *,
+        weak_ceiling: float | None = None,
+    ) -> tuple[list[ActionOut], list[dict], bool]:
         """Split the budget across the buys by conviction, capped per name.
 
         The cap is on the *resulting* weight, not the purchase: topping up
@@ -593,9 +1071,14 @@ class PortfolioActionsService:
         allocation of $94 against a $1,053 share is not a small buy, it is no
         buy. Those come back in the second list to be reported rather than
         proposed as an order nobody can place.
+
+        ``weak_ceiling`` bounds what buys the committee did not judge may draw
+        between them — the money that did not come from selling on a verdict.
+        The third return value says whether it actually bit, so the note can
+        explain the cash rather than leave it unaccounted for.
         """
         if not adds or spendable < MIN_TRADE_CAD:
-            return [], []
+            return [], [], False
 
         # Highest conviction first; ties go to the smaller position, since
         # adding to what you already hold most of is the one outcome nobody is
@@ -608,12 +1091,30 @@ class PortfolioActionsService:
         total = sum(weights.values())
         purchases: list[ActionOut] = []
         unaffordable: list[dict] = []
+        headroom = spendable if weak_ceiling is None else weak_ceiling
+        unfunded = False
         for a in adds:
             symbol = a["symbol"]
             allocation = spendable * (weights[symbol] / total)
             # Room left before this name breaches the concentration cap.
             room = max(0.0, CONCENTRATION_CAP * equity - a["current_value"])
-            allocation = min(allocation, room)
+            # Rounded to cents HERE rather than just before the order is built,
+            # so the figure compared against `headroom` is the same one that
+            # later decrements it. Rounding afterwards let a fraction of a cent
+            # per buy accumulate in `headroom`, and by the fifth name the gap
+            # was wide enough to read as a shortfall: a plan that funded every
+            # idea it had still told the user the model was only partly
+            # reachable and that a sell's proceeds were being held back — from
+            # sells it had not made.
+            allocation = round(min(allocation, room), 2)
+            # A buy the committee did not judge may only be paid for out of the
+            # money no committee-judged sell raised. Highest conviction is first
+            # in this loop, so the headroom goes to the strongest ideas.
+            weak = a.get("verdict_source") != "ai"
+            if weak:
+                capped = min(allocation, headroom)
+                unfunded = unfunded or capped < allocation - FUNDING_SHORTFALL_CAD
+                allocation = capped
             price = a["price_cad"]
 
             qty = None
@@ -637,6 +1138,8 @@ class PortfolioActionsService:
             if allocation < MIN_TRADE_CAD:
                 continue
             allocation = round(allocation, 2)
+            if weak:
+                headroom -= allocation
             projected = (a["current_value"] + allocation) / equity if equity else 0.0
             purchases.append(
                 ActionOut(
@@ -654,15 +1157,9 @@ class PortfolioActionsService:
                 )
             )
         purchases.sort(key=lambda p: p.amount, reverse=True)
-        return purchases, unaffordable
+        return purchases, unaffordable, unfunded
 
-    @staticmethod
-    def _source(results: list[dict]) -> str:
-        """ai | mixed | rules, from the verdicts that actually came back."""
-        sources = {str(r.get("source") or "rules") for r in results}
-        if not sources or sources == {"rules"}:
-            return "rules"
-        return "ai" if sources == {"ai"} else "mixed"
+    _source = staticmethod(source_of)
 
     @staticmethod
     def _note(
@@ -671,13 +1168,25 @@ class PortfolioActionsService:
         cash_after: float,
         body: ActionPlanIn,
         unfunded: bool = False,
+        factors: FactorPlanOut | None = None,
     ) -> str:
+        # Named separately from the committee's reasoning, because it is not
+        # the committee's reasoning: it is the app declining to concentrate the
+        # book further whatever the model concluded.
+        capped = ""
+        if factors is not None:
+            binding = [b for b in factors.breaches if b.binding]
+            if binding:
+                capped = " " + binding[0].message[0].upper() + binding[0].message[1:]
+            elif factors.breaches:
+                capped = " " + factors.breaches[0].message
+
         if not actions:
             kept = ", ".join(h.symbol for h in holds)
             return (
                 "No changes worth making. The committee would keep "
                 f"{kept or 'what you hold'} as it is, and nothing on the shortlist "
-                "beat what you already own. Doing nothing is a position."
+                "beat what you already own. Doing nothing is a position." + capped
             )
         sells = [a for a in actions if a.side == "sell"]
         buys = [a for a in actions if a.side == "buy"]
@@ -687,8 +1196,9 @@ class PortfolioActionsService:
         if buys:
             parts.append("put " + ", ".join(f"${a.amount:,.0f} into {a.symbol}" for a in buys))
         parked = (
-            " The model was only partly reachable, so ideas it didn't get to judge "
-            "were left unfunded and that money stays in cash."
+            " The model was only partly reachable. What a sell it judged raised is "
+            "held back rather than put into an idea it never got to judge, so part "
+            "of the proceeds stays in cash."
             if unfunded
             else ""
         )
@@ -702,6 +1212,7 @@ class PortfolioActionsService:
             + "; then ".join(parts)
             + f". ${cash_after:,.2f} stays in cash."
             + parked
+            + capped
             + sizing_note
             + " Accepting adds these to your trade checklist — nothing is placed "
             "until you approve each one."
@@ -709,10 +1220,15 @@ class PortfolioActionsService:
 
     # --- accepting (writes PROPOSED rows — never APPROVED) ---
     async def accept(self, user_id: uuid.UUID, body: ActionAcceptIn) -> ProposalOut:
-        await self.proposals.expire_open_proposals(user_id)
         batch_id = uuid.uuid4()
         dollars = body.sizing == "dollars"
 
+        # No over-sell check here on purpose. A dollar-sized sell for more than
+        # the position is *defined* as a full exit (see `_filled_qty`), so a
+        # rule at this boundary would reject the very thing the checklist means
+        # by "close it out". Both consumers of a PROPOSED row guard themselves
+        # instead: `apply_fill` refuses to book a sell the position cannot
+        # cover, and `approve_and_submit` refuses to route one to a broker.
         orders = [
             ProposedOrder(
                 user_id=user_id,
@@ -732,6 +1248,11 @@ class PortfolioActionsService:
             )
             for o in body.orders
         ]
+        # Never supersede an open checklist without a batch to replace it with:
+        # expiring on an empty accept would clear orders the user is still
+        # working through. Same invariant as the rebalancer.
+        if orders:
+            await self.proposals.expire_open_proposals(user_id)
         await self.proposals.add_all(orders)
         await self.session.commit()
 

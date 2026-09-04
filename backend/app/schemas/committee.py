@@ -26,6 +26,10 @@ class CommitteeResult(BaseModel):
     source: str  # ai | rules
     agents: list[AgentTakeOut]
     indicators: dict
+    # How much the news/macro blocks moved the verdict, and what was in them.
+    # Both additive: pre-research sessions replay with the defaults.
+    news_weight: str = "absent"  # decisive | supporting | ignored | absent
+    context: dict | None = None
     created_at: str | None = None
     disclaimer: str = (
         "Educational analysis from public market data — not investment advice. "

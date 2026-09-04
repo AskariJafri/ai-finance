@@ -21,6 +21,23 @@ export function formatPercent(fraction: number): string {
 }
 
 /**
+ * A gain/loss percentage, always signed: "+1.24%" / "-0.30%".
+ *
+ * Separate from `formatPercent` because that one rounds to whole percent —
+ * fine for a portfolio weight, but it renders every ordinary day's move as
+ * "0%" and makes a red row look like nothing happened.
+ */
+export function formatSignedPercent(fraction: number, digits = 2): string {
+  const pct = fraction * 100;
+  return `${pct >= 0 ? "+" : "-"}${Math.abs(pct).toFixed(digits)}%`;
+}
+
+/** A gain/loss amount, always signed: "+$412.30" / "-$88.10". */
+export function formatSignedCurrency(amount: number, currency = "CAD"): string {
+  return `${amount >= 0 ? "+" : "-"}${formatCurrency(Math.abs(amount), currency)}`;
+}
+
+/**
  * "2026-07-02" -> "Jul 2", in the reader's own timezone.
  *
  * The parts are split out by hand rather than handed to `new Date(iso)`,

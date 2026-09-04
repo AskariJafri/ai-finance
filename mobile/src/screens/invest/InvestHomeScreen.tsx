@@ -19,9 +19,10 @@ import {
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { InvestAiCard } from "../../components/InvestAiCard";
+import { PnlText } from "../../components/PnlText";
 import type { BrokerageConnection } from "../../api/types";
 import { useTheme } from "../../theme";
-import { formatCurrency, formatPercent } from "../../utils/format";
+import { formatCurrency, formatDate, formatPercent } from "../../utils/format";
 
 /** "3 minutes ago" — a sync time is only ever read as "how stale is this". */
 function sinceLabel(iso: string | null): string {
@@ -197,6 +198,36 @@ export function InvestHomeScreen() {
               {formatCurrency(data.account?.cash ?? 0)} cash
               {data.usd_cad_rate ? ` · USD/CAD ${data.usd_cad_rate.toFixed(2)}` : ""}
             </Text>
+
+            <View style={[styles.pnlRow, { borderTopColor: theme.colors.surfaceAlt }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.label, { color: theme.colors.textMuted }]}>
+                  Unrealized P/L
+                </Text>
+                <PnlText
+                  amount={data.account?.unrealized_pl}
+                  pct={data.account?.unrealized_pl_pct}
+                  style={styles.pnlValue}
+                />
+                <Text style={[styles.pnlNote, { color: theme.colors.textMuted }]}>
+                  on {formatCurrency(data.account?.cost_basis ?? 0)} cost
+                </Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.label, { color: theme.colors.textMuted }]}>
+                  {data.prices_as_of ? `Day (${formatDate(data.prices_as_of)})` : "Day"}
+                </Text>
+                <PnlText
+                  amount={data.account?.day_pl}
+                  pct={data.account?.day_pl_pct}
+                  placeholder="No prior close"
+                  style={styles.pnlValue}
+                />
+                <Text style={[styles.pnlNote, { color: theme.colors.textMuted }]}>
+                  vs previous close
+                </Text>
+              </View>
+            </View>
             {data.stale_symbols.length > 0 ? (
               <Text style={{ color: theme.colors.danger, fontSize: 12, marginTop: 8 }}>
                 No price data for {data.stale_symbols.join(", ")} — tap Sync data.
@@ -238,14 +269,13 @@ export function InvestHomeScreen() {
                   <Text style={{ color: theme.colors.text, fontWeight: "600" }}>
                     {formatCurrency(p.market_value)}
                   </Text>
-                  <Text
-                    style={{
-                      color: p.unrealized_pl >= 0 ? theme.colors.positive : theme.colors.negative,
-                      fontSize: 12,
-                    }}
-                  >
-                    {p.unrealized_pl >= 0 ? "+" : ""}
-                    {formatCurrency(p.unrealized_pl)} ({formatPercent(p.unrealized_pl_pct)})
+                  <PnlText
+                    amount={p.unrealized_pl}
+                    pct={p.unrealized_pl_pct}
+                    style={{ fontSize: 12 }}
+                  />
+                  <Text style={{ color: theme.colors.textMuted, fontSize: 11 }}>
+                    day <PnlText amount={p.day_pl} pct={p.day_change_pct} style={{ fontSize: 11 }} />
                   </Text>
                 </View>
               </View>
@@ -452,6 +482,15 @@ const styles = StyleSheet.create({
   label: { fontSize: 13 },
   hero: { fontSize: 34, fontWeight: "800", marginTop: 4 },
   subtle: { fontSize: 13, marginTop: 4 },
+  pnlRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  pnlValue: { fontSize: 17, fontWeight: "700", marginTop: 3 },
+  pnlNote: { fontSize: 11, marginTop: 2 },
   positionRow: { flexDirection: "row", alignItems: "center", gap: 12, marginTop: 12 },
   symbol: { fontSize: 15, fontWeight: "700" },
   weightTrack: { height: 6, borderRadius: 3, marginTop: 6, overflow: "hidden" },

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +41,10 @@ class HoldingRepository:
         currency: str,
         name: str | None,
         is_synced: bool = False,
+        broker_value_cents: int | None = None,
+        broker_valued_at: datetime | None = None,
+        book_value_cad_cents: int | None = None,
+        book_value_estimated: bool = True,
     ) -> Holding:
         row = await self.get(user_id, symbol)
         if row is None:
@@ -50,6 +55,13 @@ class HoldingRepository:
         row.currency = currency
         row.name = name
         row.is_synced = is_synced
+        # Always assigned, never merged: a hand-edited holding has no broker
+        # valuation, and a sync that could not read one must clear the last one
+        # rather than leave a stale figure looking current.
+        row.broker_value_cents = broker_value_cents
+        row.broker_valued_at = broker_valued_at
+        row.book_value_cad_cents = book_value_cad_cents
+        row.book_value_estimated = book_value_estimated
         await self.session.flush()
         return row
 

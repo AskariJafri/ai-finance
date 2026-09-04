@@ -23,11 +23,12 @@ import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics import backtest as bt
+from app.analytics import factor_risk, montecarlo, scenarios
 from app.analytics import invest_math as im
-from app.analytics import montecarlo, scenarios
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.models import Holding, ProposedOrder
+from app.domain.book_value import next_book_value_cad_cents
 from app.domain.enums import OrderSide, ProposedOrderStatus
 from app.integrations.marketdata.provider import MarketDataError, MarketDataProvider
 from app.repositories.holdings import HoldingRepository
@@ -49,6 +50,8 @@ from app.schemas.invest import (
     DcaPlanIn,
     DcaPlanOut,
     DcaProjectionPoint,
+    FactorExposureOut,
+    FactorRiskOut,
     HoldingIn,
     HoldingOut,
     PortfolioOut,
@@ -70,7 +73,7 @@ from app.schemas.invest import (
     TargetsOut,
 )
 from app.services.errors import NotFound, ValidationFailed
-from app.services.market_data_service import BENCHMARK, MarketDataService
+from app.services.market_data_service import BENCHMARK, FX_SYMBOL, MarketDataService
 
 logger = get_logger(__name__)
 
@@ -151,15 +154,38 @@ class InvestService:
                 f"{quote.symbol} is synced from your linked brokerage account and "
                 "can't be edited by hand. Trade it at your broker, then sync."
             )
+        # Bars first: the rate has to exist before anything is converted with
+        # it. On a first-ever holding there are no cached FX bars, and falling
+        # back to 1.0 would book a USD position at par — permanently, because a
+        # book value is recorded once and never recomputed.
+        await self.market_data.sync_bars([quote.symbol])
+        # A hand-entered basis is a statement about what was paid, so its CAD
+        # book is fixed at the rate on the day it is entered and rolls forward
+        # from whatever was there before — the same accounting the broker sync
+        # applies, so the two paths cannot drift apart.
+        fx = await self.market_data.latest_fx_rate() or 1.0
+        rate = fx if quote.currency.upper() == "USD" else 1.0
+        avg_cost_cents = round(body.avg_cost * 100)
         row = await self.holdings.upsert(
             user_id=user_id,
             symbol=quote.symbol,
             qty=body.qty,
-            avg_cost_cents=round(body.avg_cost * 100),
+            avg_cost_cents=avg_cost_cents,
             currency=quote.currency,
             name=quote.name,
+            book_value_cad_cents=next_book_value_cad_cents(
+                previous_cad_cents=existing.book_value_cad_cents if existing else None,
+                previous_native_cost_cents=(
+                    round(existing.avg_cost_cents * existing.qty) if existing else 0
+                ),
+                native_cost_cents=round(avg_cost_cents * body.qty),
+                fx_rate=rate,
+            ),
+            # A hand-typed average cost says what was paid, never when. Today's
+            # rate is the only one available and is almost certainly not the one
+            # that applied, so the basis is locked but not claimed as exact.
+            book_value_estimated=True,
         )
-        await self.market_data.sync_bars([quote.symbol])
         await self.session.commit()
         return _holding_out(row)
 
@@ -192,13 +218,54 @@ class InvestService:
         priced: list[dict] = []
         stale: list[str] = []
         for h in rows:
-            close = await self.market_data.latest_close(h.symbol)
-            if close is None:
+            prev, latest = await self.market_data.last_two_closes(h.symbol)
+            if latest is None:
                 stale.append(h.symbol)
                 continue
+            price_date, close = latest
             to_cad = fx if h.currency == "USD" else 1.0
-            market_value = close * h.qty * to_cad
-            cost = cents_to_dollars(h.avg_cost_cents) * h.qty * to_cad
+
+            # Prefer what the broker said this is worth, when that is the newer
+            # of the two readings. The app's own valuation is a cached daily
+            # close times our FX rate — close to the brokerage screen but never
+            # equal to it, and the gap is what makes the two impossible to
+            # reconcile. The broker's figure is the one the user is looking at.
+            #
+            # Newer of the two, not simply preferred: a valuation from a sync
+            # three days ago is worse than today's close, and silently showing
+            # stale numbers is the problem this is meant to fix, not a trade
+            # worth making for agreement's sake.
+            unit_price, value_source = close, "market"
+            if (
+                h.broker_value_cents is not None
+                and h.broker_valued_at is not None
+                and h.qty
+                and h.broker_valued_at.date() >= price_date
+            ):
+                unit_price = cents_to_dollars(h.broker_value_cents) / h.qty
+                value_source = "broker"
+
+            market_value = unit_price * h.qty * to_cad
+            # The book value is what the position cost in CAD and does not move
+            # with the exchange rate. Converting the native cost at today's rate
+            # instead — the same rate the market value uses — cancelled the
+            # currency out of the return, so a USD position showed its USD
+            # return under a CAD label and disagreed with the brokerage
+            # statement by the whole FX move. Fall back to that older behaviour
+            # only when no book was ever recorded, and say so in the row.
+            if h.book_value_cad_cents is not None:
+                cost = cents_to_dollars(h.book_value_cad_cents)
+                cost_basis_source = "estimated" if h.book_value_estimated else "book"
+            else:
+                cost = cents_to_dollars(h.avg_cost_cents) * h.qty * to_cad
+                cost_basis_source = "estimated"
+            # Day change is measured in the listing's own currency and only
+            # then converted, so an FX move doesn't masquerade as a price move.
+            # It runs off `unit_price` so that the move and the value shown
+            # agree — quoting a broker price beside a change computed from the
+            # cached close would leave the two disagreeing on screen.
+            prev_close = prev[1] if prev else None
+            day_change = (unit_price - prev_close) if prev_close else None
             priced.append(
                 {
                     "symbol": h.symbol,
@@ -208,30 +275,76 @@ class InvestService:
                     # Lets the app label a row as coming from the linked broker
                     # rather than hand-entered; only /invest/holdings knew this.
                     "is_synced": h.is_synced,
-                    "price": close,
+                    "price": unit_price,
+                    "price_date": (
+                        h.broker_valued_at.date().isoformat()
+                        if value_source == "broker" and h.broker_valued_at is not None
+                        else price_date.isoformat()
+                    ),
+                    # Which reading this row is actually showing, so the app can
+                    # say "as at your broker" rather than implying both agree.
+                    "value_source": value_source,
+                    # "book" = cost fixed at the rates actually paid, so the
+                    # return includes the currency move like a statement does.
+                    # "estimated" = no book recorded for this position yet, so
+                    # the currency move is missing from its return.
+                    "cost_basis_source": cost_basis_source,
                     "avg_cost": cents_to_dollars(h.avg_cost_cents),
+                    "cost_basis": cost,
                     "market_value": market_value,
                     "unrealized_pl": market_value - cost,
                     "unrealized_pl_pct": ((market_value / cost - 1.0) if cost else 0.0),
+                    # Per-share move in the listing currency, the position's
+                    # share of it in CAD, and the percentage (currency-free).
+                    "prev_close": prev_close,
+                    "day_change": day_change,
+                    "day_change_pct": (
+                        (day_change / prev_close) if day_change is not None and prev_close else None
+                    ),
+                    "day_pl": (day_change * h.qty * to_cad) if day_change is not None else None,
                 }
             )
 
         invested = sum(p["market_value"] for p in priced)
         total = invested + cash
+        cost_basis = sum(p["cost_basis"] for p in priced)
+        unrealized = invested - cost_basis
+        # Only positions with a yesterday contribute; summing over the rest
+        # would quietly report a partial move as the whole portfolio's.
+        dated = [p for p in priced if p["day_pl"] is not None]
+        day_pl = sum(p["day_pl"] for p in dated) if dated else None
+        prior_value = sum(p["market_value"] - p["day_pl"] for p in dated) if dated else 0.0
+        price_dates = [p["price_date"] for p in priced]
         return PortfolioOut(
             connected=True,
             as_of=date_type.today().isoformat(),
+            prices_as_of=max(price_dates) if price_dates else None,
             currency="CAD",
             usd_cad_rate=round(fx, 4),
             account=AccountOut(
-                equity=round(total, 2), cash=round(cash, 2), invested=round(invested, 2)
+                equity=round(total, 2),
+                cash=round(cash, 2),
+                invested=round(invested, 2),
+                cost_basis=round(cost_basis, 2),
+                unrealized_pl=round(unrealized, 2),
+                unrealized_pl_pct=round(unrealized / cost_basis, 4) if cost_basis else 0.0,
+                day_pl=round(day_pl, 2) if day_pl is not None else None,
+                day_pl_pct=(
+                    round(day_pl / prior_value, 4) if day_pl is not None and prior_value else None
+                ),
             ),
             positions=[
                 {
                     **p,
+                    "price": _r4(p["price"]),
                     "market_value": round(p["market_value"], 2),
+                    "cost_basis": round(p["cost_basis"], 2),
                     "unrealized_pl": round(p["unrealized_pl"], 2),
                     "unrealized_pl_pct": round(p["unrealized_pl_pct"], 4),
+                    "prev_close": _r4(p["prev_close"]),
+                    "day_change": _r4(p["day_change"]),
+                    "day_change_pct": _r4(p["day_change_pct"]),
+                    "day_pl": _r2(p["day_pl"]),
                     "weight": round(p["market_value"] / invested, 4) if invested else 0.0,
                 }
                 for p in priced
@@ -243,6 +356,12 @@ class InvestService:
         rows = await self.holdings.list_for_user(user_id)
         symbols = [h.symbol for h in rows]
         updated, added, failed = await self.market_data.sync_bars(symbols)
+        # Only the user's own tickers belong in a user-facing failure list. The
+        # benchmark and factor proxies ride along on every sync; when one of
+        # those cannot be fetched the risk block says so through
+        # `factors_unavailable`, which is where it means something.
+        held = {s.upper() for s in symbols}
+        failed = [s for s in failed if s.upper() in held]
         await self.session.commit()
         start = await self.market_data.data_start(symbols + [BENCHMARK]) if symbols else None
         return SyncOut(
@@ -342,8 +461,63 @@ class InvestService:
                 for s in held
             ],
             correlation=CorrelationOut(symbols=corr_symbols, matrix=corr_matrix),
+            factors=await self._factor_risk(user_id, w, start),
             risk_free_rate=rf,
             data_quality=quality,
+        )
+
+    async def _factor_risk(
+        self, user_id: uuid.UUID, weights: dict[str, float], start: date_type
+    ) -> FactorRiskOut:
+        """Decompose portfolio risk across the factor set.
+
+        Aligned separately from the core metrics: pulling the proxies into that
+        intersection would shorten the common window for everyone and quietly
+        change vol/Sharpe/beta, so the factor block pays its own data cost.
+        """
+        symbols = list(weights) + list(factor_risk.PROXY_SYMBOLS)
+        _, returns, _ = await self._aligned_returns(symbols, start)
+        f_returns, unavailable = factor_risk.build_factor_returns(returns)
+
+        # Regress on what a CAD holder actually earns, not on the native-currency
+        # series — otherwise a US-listed holding shows no USD/CAD loading at all.
+        pf = await self.portfolio(user_id)
+        currency_by_symbol = {p["symbol"]: p.get("currency") for p in pf.positions}
+        asset_returns = factor_risk.to_reporting_currency(
+            {s: returns[s] for s in weights if s in returns},
+            currency_by_symbol,
+            returns.get(FX_SYMBOL),
+        )
+        result = factor_risk.decompose(weights, asset_returns, f_returns, unavailable)
+        if result is None:
+            return FactorRiskOut(
+                factors_unavailable=[f.key for f in factor_risk.FACTORS],
+                reason=(
+                    "Not enough overlapping history across your holdings and the "
+                    "factor proxies yet — tap Sync data."
+                ),
+            )
+        return FactorRiskOut(
+            exposures=[
+                FactorExposureOut(
+                    key=e.key,
+                    name=e.name,
+                    exposure=_r4(e.exposure),
+                    variance_share=_r4(e.variance_share),
+                    contrib_vol=_r4(e.contrib_vol),
+                    standalone_vol=_r4(e.standalone_vol),
+                    unit=e.unit,
+                    duration_years=_r2(e.duration_years),
+                )
+                for e in result.exposures
+            ],
+            factor_vol=_r4(result.factor_vol),
+            idiosyncratic_vol=_r4(result.idiosyncratic_vol),
+            total_vol=_r4(result.total_vol),
+            r_squared=_r4(result.r_squared),
+            diversification_benefit=_r4(result.diversification_benefit),
+            factors_used=result.factors_used,
+            factors_unavailable=result.factors_unavailable,
         )
 
     # --- dca ---
@@ -521,12 +695,24 @@ class InvestService:
         _, returns, _ = await self._aligned_returns(list(weights) + [BENCHMARK], start)
         bench = returns.get(BENCHMARK)
 
+        # Currency comes from the portfolio, not the weights: without it every
+        # position looks domestic and the FX leg of each scenario is a no-op.
+        pf = await self.portfolio(user_id)
+        currency_by_symbol = {p["symbol"]: p.get("currency") for p in pf.positions}
+
         positions = []
         for symbol, weight in weights.items():
             b = None
             if bench is not None and symbol in returns:
                 b = im.beta(returns[symbol], bench)
-            positions.append({"symbol": symbol, "market_value": weight * total_value, "beta": b})
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "market_value": weight * total_value,
+                    "beta": b,
+                    "currency": currency_by_symbol.get(symbol),
+                }
+            )
 
         out = []
         for scenario in scenarios.SCENARIOS:
@@ -584,10 +770,29 @@ class InvestService:
 
         invested = sum(p["market_value"] for p in pf.positions)
         cash = pf.account.cash if pf.account else 0.0
-        account_value = invested + cash
         by_symbol = {p["symbol"]: p for p in pf.positions}
 
-        await self.proposals.expire_open_proposals(user_id)
+        # A holding with no target row is *unmanaged*, not unwanted.
+        #
+        # This used to read a missing row as a 0% target and propose selling the
+        # whole position. That is inference presented as instruction, and it put
+        # this planner permanently at odds with the AI one: the actions planner
+        # shops names you do not own, ``accept`` never writes a target, so every
+        # name it recommended came back here marked for liquidation the moment
+        # you bought it. Buy AVGO because the committee liked it, and the next
+        # rebalance tells you to sell AVGO and buy NVDA.
+        #
+        # Silence is not a decision. Zero still is — ``TargetIn.weight`` accepts
+        # it precisely so "I hold this and want none of it" can be *said* — so an
+        # explicit 0% target sells out exactly as before.
+        unmanaged = sorted(set(by_symbol) - set(targets))
+        unmanaged_value = sum(by_symbol[s]["market_value"] for s in unmanaged)
+
+        # Targets are weights of the sleeve they govern. Leaving an untargeted
+        # position in the denominator would make every targeted name look
+        # underweight by its size and propose buying the whole book back up.
+        account_value = invested + cash - unmanaged_value
+
         batch_id = uuid.uuid4()
         orders: list[ProposedOrder] = []
         # Anything the chosen sizing cannot express. Reported in the note rather
@@ -595,9 +800,9 @@ class InvestService:
         # reads as "nothing to do here", which is the opposite of the truth.
         skipped: list[str] = []
 
-        for symbol in sorted(set(by_symbol) | set(targets)):
+        for symbol in sorted(targets):
             current_value = by_symbol.get(symbol, {}).get("market_value", 0.0)
-            target_w = targets.get(symbol, 0.0)
+            target_w = targets[symbol]
             target_value = target_w * account_value
             drift = (current_value / account_value if account_value else 0.0) - target_w
             if abs(drift) < drift_threshold:
@@ -670,6 +875,12 @@ class InvestService:
         total_sell = sum(
             cents_to_dollars(o.est_value_cents) for o in orders if o.side == OrderSide.SELL
         )
+        # Supersede the open checklist only when there is a new batch to put in
+        # its place. Expiring up front meant a rebalance with nothing to suggest
+        # ("everything is within target") silently cleared buys the user was
+        # still working through -- they lost orders by asking a question.
+        if orders:
+            await self.proposals.expire_open_proposals(user_id)
         await self.proposals.add_all(orders)
         await self.session.commit()
 
@@ -680,21 +891,38 @@ class InvestService:
             if skipped
             else ""
         )
+        # Say it every time, including on a plan with no trades. A position this
+        # planner is deliberately not managing must never be silently absent —
+        # that reads as "on target", which is the one thing it does not mean.
+        unmanaged_note = (
+            f" {', '.join(unmanaged)} "
+            + ("has" if len(unmanaged) == 1 else "have")
+            + " no target weight, so this rebalance leaves "
+            + ("it" if len(unmanaged) == 1 else "them")
+            + " alone and works with the rest of the account. Add a target to "
+            + ("manage it" if len(unmanaged) == 1 else "manage them")
+            + ", or set 0% to sell out."
+            if unmanaged
+            else ""
+        )
         if not orders:
             note = (
                 f"Everything is within {drift_threshold:.0%} of target — no trades needed."
                 + skipped_note
+                + unmanaged_note
             )
         elif sizing == "dollars":
             note = (
                 "Dollar amounts, so this needs a broker that sells fractional "
                 "shares. Place them at your own broker, then mark each one done "
-                "— your holdings update automatically. Sells first, then buys."
+                "— your holdings update automatically. Sells first, then buys." + unmanaged_note
             )
         else:
             note = (
                 "Place these trades at your own broker, then mark each one done — "
-                "your holdings update automatically. Sells first, then buys." + skipped_note
+                "your holdings update automatically. Sells first, then buys."
+                + skipped_note
+                + unmanaged_note
             )
         return ProposalOut(
             batch_id=str(batch_id) if orders else None,
@@ -734,30 +962,32 @@ class InvestService:
         shares makes every executed sell destroy its own proceeds and every buy
         conjure its cost, so the account total drifts by the size of each trade.
         """
-        filled_qty = order.qty if qty is None else qty
-        filled_qty = filled_qty or 0.0
         holding = await self.holdings.get(user_id, order.symbol)
+        filled_qty = await self._filled_qty(order, qty, fill_price, holding)
 
         if order.side == OrderSide.SELL:
             if holding is None or holding.qty < filled_qty - 1e-9:
                 raise ValidationFailed(
                     f"You don't hold {filled_qty:g} shares of {order.symbol} to sell."
                 )
-            proceeds = await self._fill_value_cad(order, holding.currency, filled_qty, fill_price)
+            # Shares and cash are valued off the same price, so the proceeds are
+            # always what the shares that left were worth -- they cannot drift
+            # apart the way a separately-recorded amount could.
+            price_cad = await self._price_cad(order.symbol, fill_price, holding)
             remaining = holding.qty - filled_qty
             if remaining <= 1e-9:
                 await self.holdings.delete(user_id, holding.id)
             else:
                 holding.qty = remaining
-            await self._move_cash(user_id, proceeds)
+            await self._move_cash(user_id, filled_qty * price_cad)
             return
 
         quote = await self.lookup_symbol(order.symbol)
         price = fill_price if fill_price is not None else quote.price
-        await self._move_cash(
-            user_id,
-            -await self._fill_value_cad(order, quote.currency, filled_qty, price),
-        )
+        price_cad = price
+        if quote.currency.upper() == "USD":
+            price_cad *= await self.market_data.latest_fx_rate() or 1.0
+        await self._move_cash(user_id, -filled_qty * price_cad)
         if holding is None:
             await self.holdings.upsert(
                 user_id=user_id,
@@ -774,32 +1004,58 @@ class InvestService:
             holding.avg_cost_cents = round(((old_cost + price * filled_qty) / new_qty) * 100)
             holding.qty = new_qty
 
-    async def _fill_value_cad(
+    async def _filled_qty(
         self,
         order: ProposedOrder,
-        currency: str,
-        filled_qty: float,
+        qty: float | None,
         fill_price: float | None,
+        holding: Holding | None,
     ) -> float:
-        """What the trade was worth, in CAD.
+        """How many shares this fill actually moved.
 
-        A dollar-sized order already carries its value; a share-sized one is
-        quantity times the fill price, converted like everything else in the
-        portfolio.
+        A share-sized order carries its own quantity. A **dollar-sized** one
+        does not -- it stores the amount in ``notional_cents`` and leaves
+        ``qty`` NULL, because the share count it implies moves with the price
+        between proposing and filling. Reading ``order.qty or 0.0`` for those
+        made every notional fill move zero shares while still moving the full
+        cash amount: a sell credited its proceeds and left the position intact,
+        a buy debited the cost and never added the shares. Two of those and the
+        app no longer matches the brokerage account it is mirroring.
         """
-        if order.notional_cents and filled_qty == (order.qty or 0.0):
-            # Notional orders have no share count of their own, so their
-            # recorded amount is the value — already CAD, like every figure the
-            # planners produce.
-            return cents_to_dollars(order.notional_cents)
-        if fill_price is None:
-            quote = await self.lookup_symbol(order.symbol)
-            fill_price = quote.price
-            currency = quote.currency
-        value = filled_qty * fill_price
+        if qty is not None:
+            return qty
+        if order.qty is not None:
+            return order.qty
+        amount_cad = cents_to_dollars(order.notional_cents or order.est_value_cents)
+        price_cad = await self._price_cad(order.symbol, fill_price, holding)
+        if not price_cad:
+            raise ValidationFailed(
+                f"Couldn't price {order.symbol} to work out how many shares "
+                f"${amount_cad:,.2f} bought. Enter the fill price and try again."
+            )
+        shares = round(amount_cad / price_cad, 4)
+        # Selling "$34 of ZAG" when only $33.90 is left is a full exit, not an
+        # over-sell. Clamp to the position so the remainder can't go negative,
+        # and treat a whisker-close amount as closing it out entirely.
+        if order.side == OrderSide.SELL and holding is not None:
+            shares = min(shares, holding.qty)
+            if holding.qty - shares < 0.01:
+                shares = holding.qty
+        return shares
+
+    async def _price_cad(
+        self, symbol: str, fill_price: float | None, holding: Holding | None
+    ) -> float:
+        """Price per share in CAD -- the currency ``notional_cents`` is in."""
+        currency = holding.currency if holding is not None else None
+        price = fill_price
+        if price is None or currency is None:
+            quote = await self.lookup_symbol(symbol)
+            price = quote.price if price is None else price
+            currency = currency or quote.currency
         if currency.upper() == "USD":
-            value *= await self.market_data.latest_fx_rate() or 1.0
-        return value
+            price *= await self.market_data.latest_fx_rate() or 1.0
+        return price
 
     async def _move_cash(self, user_id: uuid.UUID, delta_cad: float) -> None:
         """Credit or debit the tracked cash balance. Never below zero.
@@ -817,7 +1073,7 @@ class InvestService:
         self, user_id: uuid.UUID, order_id: uuid.UUID, fill_price: float | None
     ) -> ProposedOrderOut:
         """The user placed this trade at their broker — update holdings to match."""
-        order = await self.proposals.get_for_user(user_id, order_id)
+        order = await self.proposals.get_for_user(user_id, order_id, for_update=True)
         if order is None:
             raise NotFound("Proposed order not found.")
         if order.status != ProposedOrderStatus.PROPOSED:
@@ -829,7 +1085,7 @@ class InvestService:
         return order_out(order)
 
     async def reject_order(self, user_id: uuid.UUID, order_id: uuid.UUID) -> ProposedOrderOut:
-        order = await self.proposals.get_for_user(user_id, order_id)
+        order = await self.proposals.get_for_user(user_id, order_id, for_update=True)
         if order is None:
             raise NotFound("Proposed order not found.")
         if order.status != ProposedOrderStatus.PROPOSED:
@@ -896,14 +1152,50 @@ class InvestService:
             "from_brokerage": any(p.get("is_synced") for p in portfolio.positions),
             "risk": risk.portfolio.model_dump(),
             "risk_bucket": bucket,
+            # What KIND of risk, not just how much. A single vol number cannot
+            # tell the model whether a drawdown would come from the equity
+            # market, the currency, or rates — and that is exactly what decides
+            # whether a proposed trade diversifies or doubles down.
+            "factors": _factor_figures(risk.factors),
             "concentration": risk.concentration.model_dump() if risk.concentration else None,
             "drifted_positions": drifts,
             "has_targets": bool(target_map),
         }
 
 
+def _factor_figures(factors: FactorRiskOut | None) -> dict | None:
+    """Compact factor block for the LLM context — exposures worth naming only.
+
+    Near-zero loadings are dropped rather than listed at 0.00: a prompt that
+    enumerates every factor invites the model to comment on all of them, and
+    the point is to surface the two or three that actually drive the book.
+    """
+    if factors is None or not factors.exposures:
+        return None
+    material = [
+        {
+            "factor": e.name,
+            "exposure": e.exposure,
+            "share_of_risk": e.variance_share,
+            **({"duration_years": e.duration_years} if e.duration_years is not None else {}),
+        }
+        for e in factors.exposures
+        if abs(e.variance_share) >= 0.02
+    ]
+    return {
+        "exposures": material,
+        "explained_pct": factors.r_squared,
+        "idiosyncratic_vol": factors.idiosyncratic_vol,
+        "diversification_benefit": factors.diversification_benefit,
+    }
+
+
 def _r4(v: float | None) -> float | None:
     return round(v, 4) if v is not None else None
+
+
+def _r2(v: float | None) -> float | None:
+    return round(v, 2) if v is not None else None
 
 
 def _round_metrics(m: dict) -> dict:
