@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import {
-  Alert,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -14,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useLogin, useRegister } from "../api/hooks";
 import { Button } from "../components/Button";
+import { alert } from "../lib/alert";
 import { useAppConfig } from "../stores/appConfig";
 import { useTheme } from "../theme";
 
@@ -38,7 +38,7 @@ export function AuthScreen() {
 
   const onSaveServer = async () => {
     await setBaseUrl(serverDraft);
-    Alert.alert("Saved", "Server URL updated.");
+    alert("Saved", "Server URL updated.");
   };
 
   const { control, handleSubmit } = useForm<FormValues>({
@@ -142,13 +142,17 @@ export function AuthScreen() {
               : "Already have an account? Log in"}
           </Text>
 
+          {/* Phone-only, for the same reason as the Settings row: a web build
+              is served by the deployment that already chose its backend. */}
+          {Platform.OS !== "web" && (
           <Text
             onPress={() => setShowServer((v) => !v)}
             style={[styles.serverToggle, { color: theme.colors.textMuted }]}
           >
             {showServer ? "Hide server settings" : "Can't connect? Server settings"}
           </Text>
-          {showServer && (
+          )}
+          {Platform.OS !== "web" && showServer && (
             <View style={{ marginTop: 8 }}>
               <TextInput
                 value={serverDraft}

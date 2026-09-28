@@ -1,0 +1,11 @@
+# Everything here ships inside the Function bundle, which is size-capped and
+# whose contents are readable at runtime. Nothing below is needed to serve a
+# request.
+tests/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+Dockerfile

@@ -1,6 +1,6 @@
 import { useNavigation } from "@react-navigation/native";
 import { useRef, useState } from "react";
-import { Alert, StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
   LinkLogLevel,
@@ -13,6 +13,7 @@ import {
 import { useCreateLinkToken, useExchangePublicToken } from "../api/hooks";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { alert } from "../lib/alert";
 import { useTheme } from "../theme";
 
 export function LinkBankScreen() {
@@ -53,7 +54,7 @@ export function LinkBankScreen() {
             });
             navigation.goBack();
           } catch {
-            Alert.alert("Sync failed", "Linked, but we couldn't sync. Try Sync on the dashboard.");
+            alert("Sync failed", "Linked, but we couldn't sync. Try Sync on the dashboard.");
           } finally {
             setBusy(false);
           }
@@ -77,13 +78,13 @@ export function LinkBankScreen() {
             meta?.requestId ? `Request: ${meta.requestId}` : null,
           ].filter(Boolean);
           if (lines.length > 0) {
-            Alert.alert("Plaid Link exited", lines.join("\n"));
+            alert("Plaid Link exited", lines.join("\n"));
           }
         },
       });
     } catch (err) {
       setBusy(false);
-      Alert.alert(
+      alert(
         "Could not start Plaid Link",
         "Make sure you're running a dev build (not Expo Go) and the backend is reachable.",
       );

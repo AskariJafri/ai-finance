@@ -30,6 +30,19 @@ dev = [
     "ruff>=0.5",
 ]
 
+# --- Vercel ---
+# The ASGI app Vercel wraps as a Function. ``app/main.py`` is already one of the
+# entrypoints it auto-detects; naming it here keeps the contract explicit rather
+# than conventional.
+[tool.vercel]
+entrypoint = "app.main:app"
+
+# Runs after dependencies install, before the deploy goes live. This is where
+# migrations and seeding live on a host with no startup hook — see
+# ``vercel_build.py``.
+[tool.vercel.scripts]
+build = "python vercel_build.py"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

@@ -10,6 +10,12 @@ __pycache__/
 .env
 backend/.env
 mobile/.env
+.env.local
+.env.*.local
+!.env.example
+
+# Vercel (per-project link metadata, machine-local)
+.vercel/
 
 # Node / Expo
 node_modules/
@@ -23,4 +29,3 @@ Thumbs.db
 
 # ---- Machine-local agent/editor settings ----
 .claude/settings.local.json
-

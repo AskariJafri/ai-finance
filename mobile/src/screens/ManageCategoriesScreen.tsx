@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import {
@@ -10,6 +10,7 @@ import {
 } from "../api/hooks";
 import { Card } from "../components/Card";
 import { Category } from "../api/types";
+import { alert } from "../lib/alert";
 import { useTheme } from "../theme";
 import { CUSTOM_CATEGORY_PALETTE } from "../utils/categoryPalette";
 
@@ -74,7 +75,7 @@ export function ManageCategoriesScreen() {
   };
 
   const confirmDelete = (c: Category) => {
-    Alert.alert(
+    alert(
       `Delete "${c.name}"?`,
       "Every transaction in this category moves to Uncategorized. This can't be undone.",
       [
@@ -90,7 +91,7 @@ export function ManageCategoriesScreen() {
 
   const onLongPress = (c: Category) => {
     if (c.is_system) return;
-    Alert.alert(c.name, undefined, [
+    alert(c.name, undefined, [
       { text: "Cancel", style: "cancel" },
       { text: "Edit", onPress: () => startEditing(c) },
       { text: "Delete", style: "destructive", onPress: () => confirmDelete(c) },

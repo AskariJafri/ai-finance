@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -22,6 +21,7 @@ import {
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { PnlText } from "../../components/PnlText";
+import { alert } from "../../lib/alert";
 import { useTheme } from "../../theme";
 import { formatCurrency } from "../../utils/format";
 
@@ -43,7 +43,7 @@ export function HoldingsScreen() {
     if (!symbol.trim()) return;
     lookup.mutate(symbol.trim().toUpperCase(), {
       onError: (err: any) =>
-        Alert.alert(
+        alert(
           "Ticker not found",
           err?.response?.data?.detail ??
             "Check the symbol. Canadian listings need '.TO' (e.g. VFV.TO).",
@@ -55,7 +55,7 @@ export function HoldingsScreen() {
     const q = Number(qty);
     const c = Number(cost);
     if (!symbol.trim() || !(q > 0)) {
-      Alert.alert("Missing info", "Enter a ticker and the number of shares.");
+      alert("Missing info", "Enter a ticker and the number of shares.");
       return;
     }
     upsert.mutate(
@@ -68,7 +68,7 @@ export function HoldingsScreen() {
           lookup.reset();
         },
         onError: (err: any) =>
-          Alert.alert("Failed", err?.response?.data?.detail ?? "Could not add holding."),
+          alert("Failed", err?.response?.data?.detail ?? "Could not add holding."),
       },
     );
   };
@@ -217,11 +217,11 @@ export function HoldingsScreen() {
                       h.is_synced
                         ? // Removing it locally would be undone by the next
                           // sync, so say so rather than pretending it worked.
-                          Alert.alert(
+                          alert(
                             "Synced holding",
                             `${h.symbol} comes from your linked brokerage account. Close the position at your broker, then sync — removing it here would come back on the next sync.`,
                           )
-                        : Alert.alert("Remove holding", `Remove ${h.symbol}?`, [
+                        : alert("Remove holding", `Remove ${h.symbol}?`, [
                             { text: "Cancel", style: "cancel" },
                             {
                               text: "Remove",

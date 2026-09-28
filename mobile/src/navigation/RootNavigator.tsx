@@ -31,6 +31,7 @@ import { RiskScreen } from "../screens/invest/RiskScreen";
 import { ScenariosScreen } from "../screens/invest/ScenariosScreen";
 import { SymbolChartScreen } from "../screens/invest/SymbolChartScreen";
 import { WatchlistScreen } from "../screens/invest/WatchlistScreen";
+import { linking } from "./linking";
 import { useAppConfig } from "../stores/appConfig";
 import { useSession } from "../stores/session";
 import { useTheme } from "../theme";
@@ -204,7 +205,7 @@ export function RootNavigator() {
   }
 
   return (
-    <NavigationContainer theme={navTheme}>
+    <NavigationContainer theme={navTheme} linking={linking}>
       {status === "authenticated" ? (
         <Stack.Navigator>
           <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />

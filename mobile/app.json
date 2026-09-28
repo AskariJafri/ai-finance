@@ -7,6 +7,10 @@
     "scheme": "aifinance",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": false,
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.aifinance.app"
@@ -29,7 +33,7 @@
       ]
     ],
     "extra": {
-      "apiBaseUrl": "http://192.168.40.28:8010/api/v1",
+      "apiBaseUrl": "https://ai-finance-api.vercel.app/api/v1",
       "eas": {
         "projectId": "58b888ee-067c-4d47-8bf6-65d288813fe4"
       }

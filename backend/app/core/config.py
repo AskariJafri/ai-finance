@@ -85,6 +85,24 @@ class Settings(BaseSettings):
     # --- Database ---
     # async driver URL, e.g. postgresql+asyncpg://user:pass@localhost:5432/finance
     database_url: str = "postgresql+asyncpg://finance:finance@localhost:5432/finance"
+    # Hold no connections between requests. A long-lived container wants the
+    # default QueuePool; a serverless host does not, because the pool is per
+    # instance and the platform decides how many instances exist. Fifteen
+    # connections (5 + 10 overflow) times however many warm instances is how a
+    # free-tier Postgres runs out of connections while serving almost no
+    # traffic.
+    database_null_pool: bool = False
+    # Talking to PgBouncer (Neon's ``-pooler`` host, Supabase's port 6543)
+    # rather than to Postgres directly. In transaction pooling mode a
+    # connection is not yours between statements, so asyncpg's prepared
+    # statements — which it creates by default, and SQLAlchemy caches on top of
+    # — are prepared on one backend and executed on another. Setting both
+    # caches to zero is what makes the driver safe behind a pooler.
+    database_pgbouncer: bool = False
+    # Seed the category taxonomy during application startup. True is right for
+    # a container that boots once; on a serverless host every cold start would
+    # repeat the write, so the deploy's build step does it instead.
+    seed_on_startup: bool = True
 
     # --- Auth / JWT ---
     jwt_secret: str = DEV_JWT_SECRET

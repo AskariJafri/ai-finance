@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -19,6 +18,7 @@ import {
 } from "../../api/hooks";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
+import { alert } from "../../lib/alert";
 import { useTheme } from "../../theme";
 import { formatCurrency, formatPercent } from "../../utils/format";
 
@@ -35,7 +35,7 @@ export function PaperTradingScreen() {
     const sym = symbol.trim().toUpperCase();
     const q = Number(qty);
     if (!sym || !(q > 0)) {
-      Alert.alert("Missing info", "Enter a ticker and a share quantity.");
+      alert("Missing info", "Enter a ticker and a share quantity.");
       return;
     }
     const m = side === "buy" ? buy : sell;
@@ -44,7 +44,7 @@ export function PaperTradingScreen() {
       {
         onSuccess: () => setQty(""),
         onError: (err: any) =>
-          Alert.alert("Trade failed", err?.response?.data?.detail ?? "Could not place trade."),
+          alert("Trade failed", err?.response?.data?.detail ?? "Could not place trade."),
       },
     );
   };

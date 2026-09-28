@@ -2,13 +2,13 @@ import { useRoute } from "@react-navigation/native";
 import { useState } from "react";
 import {
   ActivityIndicator,
-  Dimensions,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -56,7 +56,11 @@ export function SymbolChartScreen() {
   const changePct = change != null && baseline ? change / baseline : null;
   const positive = (change ?? 0) >= 0;
 
-  const chartWidth = Math.max(240, Dimensions.get("window").width - 64);
+  // A hook rather than Dimensions.get: in a browser the window is resizable,
+  // and a width read once at mount leaves the chart the wrong size for the
+  // rest of the session.
+  const { width } = useWindowDimensions();
+  const chartWidth = Math.max(240, width - 64);
 
   return (
     <SafeAreaView

@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -15,6 +14,7 @@ import { useAnalyzeStock, useCommitteeSessions } from "../../api/hooks";
 import { AgentTake, CommitteeResult } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
+import { alert } from "../../lib/alert";
 import { useTheme } from "../../theme";
 
 export function CommitteeScreen() {
@@ -44,7 +44,7 @@ export function CommitteeScreen() {
     analyze.mutate(sym, {
       onSuccess: (r) => setResult(r),
       onError: (err: any) =>
-        Alert.alert(
+        alert(
           "Couldn't analyze",
           err?.response?.data?.detail ?? "Check the symbol and try again.",
         ),

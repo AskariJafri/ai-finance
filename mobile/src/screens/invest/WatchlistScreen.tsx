@@ -2,7 +2,6 @@ import { useNavigation } from "@react-navigation/native";
 import { useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -16,6 +15,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useAddWatch, useRemoveWatch, useWatchlist } from "../../api/hooks";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
+import { alert } from "../../lib/alert";
 import { useTheme } from "../../theme";
 import { formatCurrency, formatPercent } from "../../utils/format";
 
@@ -35,7 +35,7 @@ export function WatchlistScreen() {
     add.mutate(sym, {
       onSuccess: () => setSymbol(""),
       onError: (err: any) =>
-        Alert.alert(
+        alert(
           "Couldn't add",
           err?.response?.data?.detail ??
             "Check the symbol. Canadian listings need '.TO' (e.g. VFV.TO).",
@@ -44,7 +44,7 @@ export function WatchlistScreen() {
   };
 
   const confirmRemove = (id: string, sym: string) =>
-    Alert.alert("Remove", `Remove ${sym} from your watchlist?`, [
+    alert("Remove", `Remove ${sym} from your watchlist?`, [
       { text: "Cancel", style: "cancel" },
       { text: "Remove", style: "destructive", onPress: () => remove.mutate(id) },
     ]);

@@ -57,7 +57,14 @@ async def seed_with_retry(attempts: int = 5, delay: float = 2.0) -> None:
 async def lifespan(app: FastAPI):
     configure_logging(logging.DEBUG if settings.debug else logging.INFO)
     logger.info("Starting %s (%s)", settings.app_name, settings.environment)
-    await seed_with_retry()
+    # Seeding belongs to a boot, and on a serverless host "boot" happens per
+    # cold start — each one paying a write, and up to twenty seconds of retry
+    # sleep, for work the previous instance already did. There the deploy's
+    # build step seeds once and this is switched off.
+    if settings.seed_on_startup:
+        await seed_with_retry()
+    else:
+        logger.info("Startup seeding disabled (SEED_ON_STARTUP=false)")
     yield
 
 

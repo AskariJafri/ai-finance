@@ -3,7 +3,7 @@ import * as Linking from "expo-linking";
 import * as WebBrowser from "expo-web-browser";
 import { useEffect, useState } from "react";
 import {
-  Alert,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -25,6 +25,7 @@ import {
 } from "../api/hooks";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { alert } from "../lib/alert";
 import { useAppConfig } from "../stores/appConfig";
 import { useSession } from "../stores/session";
 import { useTheme } from "../theme";
@@ -50,12 +51,12 @@ export function SettingsScreen() {
   const finishLinkBrokerage = async () => {
     try {
       const accounts = await completeLink.mutateAsync();
-      Alert.alert(
+      alert(
         "Brokerage linked",
         `Linked ${accounts.length} account${accounts.length === 1 ? "" : "s"}. Sync to pull your positions in.`,
       );
     } catch (e: any) {
-      Alert.alert("Not linked yet", detailOf(e) ?? "Please try again.");
+      alert("Not linked yet", detailOf(e) ?? "Please try again.");
     }
   };
 
@@ -79,18 +80,18 @@ export function SettingsScreen() {
       } else {
         // Dismissed without the redirect firing. The connection may still have
         // gone through on SnapTrade's side, so point at the manual finish.
-        Alert.alert(
+        alert(
           "Almost there",
           'If you authorized your brokerage, tap "I\'ve authorized — finish linking" to pull your accounts in.',
         );
       }
     } catch (e: any) {
-      Alert.alert("Couldn't start linking", detailOf(e) ?? "Please try again.");
+      alert("Couldn't start linking", detailOf(e) ?? "Please try again.");
     }
   };
 
   const confirmUnlink = () =>
-    Alert.alert(
+    alert(
       "Unlink brokerage?",
       "Positions synced from your broker are removed. Holdings you entered by hand are kept.",
       [
@@ -115,12 +116,12 @@ export function SettingsScreen() {
   const onSaveUrl = async () => {
     await setBaseUrl(urlDraft);
     status.refetch();
-    Alert.alert("Saved", "Server URL updated.");
+    alert("Saved", "Server URL updated.");
   };
 
   const onSaveKeys = () => {
     if (!clientId.trim() || !secret.trim()) {
-      Alert.alert("Missing fields", "Enter both client ID and secret.");
+      alert("Missing fields", "Enter both client ID and secret.");
       return;
     }
     setCreds.mutate(
@@ -128,9 +129,9 @@ export function SettingsScreen() {
       {
         onSuccess: () => {
           setSecret("");
-          Alert.alert("Saved", "Your Plaid keys are stored securely.");
+          alert("Saved", "Your Plaid keys are stored securely.");
         },
-        onError: () => Alert.alert("Failed", "Could not save keys. Check the server URL."),
+        onError: () => alert("Failed", "Could not save keys. Check the server URL."),
       },
     );
   };
@@ -152,7 +153,13 @@ export function SettingsScreen() {
 
       <ScrollView contentContainerStyle={{ padding: 16, paddingTop: 4, gap: 14 }}>
 
-        {/* Server connection */}
+        {/* Server connection. The installed app is pointed at a backend by
+            hand — a LAN IP, a tunnel, a deployed URL — which is why this row
+            exists. The web build is already served from the deployment that
+            chose its backend, so the field there would only offer a way to
+            point the hosted page somewhere else, and the choice would outlive
+            the next deploy because it persists in localStorage. */}
+        {Platform.OS !== "web" && (
         <Card>
           <Text style={[styles.cardTitle, { color: theme.colors.text }]}>Server connection</Text>
           <Text style={[styles.help, { color: theme.colors.textMuted }]}>
@@ -170,6 +177,7 @@ export function SettingsScreen() {
           />
           <Button title="Save server URL" onPress={onSaveUrl} style={{ marginTop: 12 }} />
         </Card>
+        )}
 
         {/* Plaid credentials */}
         <Card>
