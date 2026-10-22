@@ -256,7 +256,15 @@ class PortfolioActionsService:
         # Each verdict degrades on its own, so "the AI ran" is not a property of
         # the request — it is a count of which ones actually came back. Saying
         # "ai" over a plan that is mostly rules would overstate it.
-        source = self._source([*held_results.values(), *candidates])
+        verdicts = [*held_results.values(), *candidates]
+        source = self._source(verdicts)
+        ai_note = ai_offline_note(
+            source,
+            verdicts,
+            requested=body.use_ai,
+            configured=settings.ai_available,
+            pool_status=getattr(self.llm, "status", None),
+        )
 
         # Refit over holdings and shortlist together. The overlay compares the
         # book as it stands to the book the plan would leave, and that
@@ -298,6 +306,7 @@ class PortfolioActionsService:
             passed=self.deploy._trim_passed(passed),
             considered=considered + len(held),
             source=source,
+            ai_note=ai_note,
             note=self._note(actions, holds, cash_after, body, unfunded, sized.factors),
             factors=sized.factors,
             research=research_out(
@@ -444,6 +453,7 @@ class PortfolioActionsService:
             rules={sym: rules_verdict(ind, held=True) for sym, _, ind, _ in quoted},
             market=market,
             portfolio=brief,
+            second_opinion=settings.llm_second_opinion_on_sells,
         )
         return (
             {r["symbol"]: r for r in results},
@@ -1275,3 +1285,71 @@ class PortfolioActionsService:
                 "automatically. Nothing is placed for you."
             ),
         )
+
+
+#: Plain-English names for the pool's member states, as a reason for the user.
+_STATE_REASON = {
+    "quota": "used up its free daily limit",
+    "rate_limited": "is rate-limited",
+    "model_gone": "has a model that no longer exists",
+    "bad_key": "rejected its API key",
+    "transport": "timed out",
+}
+
+
+def _wait_phrase(seconds: int) -> str:
+    if seconds >= 3600:
+        return f"~{round(seconds / 3600)}h"
+    if seconds >= 60:
+        return f"~{round(seconds / 60)} min"
+    return "under a minute"
+
+
+def ai_offline_note(
+    source: str,
+    verdicts: list[dict],
+    *,
+    requested: bool,
+    configured: bool,
+    pool_status=None,
+) -> str | None:
+    """One line saying *why* a plan is not all AI, or None when it is.
+
+    "The model was unreachable" told the user nothing they could act on. The
+    reason is usually knowable — a spent free tier, a retired model, a server
+    with no key — and each has a different fix (wait, update config, add a key).
+    """
+    if source == "ai" or not verdicts:
+        return None
+    if not requested:
+        return "AI was switched off for this plan."
+    if not configured:
+        return "AI is not configured on the server (no LLM API key set)."
+
+    members: list[dict] = []
+    if callable(pool_status):
+        try:
+            members = list(pool_status())
+        except Exception:  # noqa: BLE001 — a diagnostic must not fail the plan
+            members = []
+    down = [m for m in members if m.get("state") != "ok"]
+
+    if members and len(down) == len(members):
+        reasons: dict[str, int] = {}
+        for m in down:
+            reason = _STATE_REASON.get(str(m.get("state")), "is unavailable")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        why = "; ".join(
+            f"{n} {'provider' if n == 1 else 'providers'} {r}" for r, n in reasons.items()
+        )
+        waits = [int(m.get("retry_in") or 0) for m in down if m.get("state") != "bad_key"]
+        when = f" Next one frees up in {_wait_phrase(min(waits))}." if waits else ""
+        return f"Every AI provider is unavailable ({why}).{when}"
+
+    if source == "mixed":
+        rules = sum(1 for v in verdicts if v.get("source") != "ai")
+        return (
+            f"AI providers were busy; {rules} of {len(verdicts)} verdicts are rules-based. "
+            "Rebuilding in a minute usually gets more AI answers."
+        )
+    return "The AI providers did not answer in time, so every verdict is rules-based. Try again in a minute."

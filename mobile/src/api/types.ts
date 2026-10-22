@@ -703,6 +703,8 @@ export type ActionPlan = {
   considered: number;
   /** "mixed" means some verdicts fell back to rules when the model was down. */
   source: "ai" | "mixed" | "rules";
+  /** Why the AI did not answer everything, in one line; null when it did. */
+  ai_note?: string | null;
   note: string;
   factors: FactorPlan | null;
   disclaimer: string;
@@ -765,10 +767,18 @@ export type ChatSuggestion = {
   group: "money" | "invest" | "learn";
 };
 
+export type LLMEndpointStatus = {
+  label: string;
+  model: string | null;
+  state: string; // ok | quota | rate_limited | model_gone | bad_key | transport
+  retry_in: number;
+};
+
 export type ChatStatus = {
   ai_enabled: boolean;
   llm_available: boolean;
   model: string | null;
+  endpoints?: LLMEndpointStatus[];
   suggestions: ChatSuggestion[];
   disclaimer: string;
 };

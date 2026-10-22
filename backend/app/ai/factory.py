@@ -33,6 +33,8 @@ def get_llm_provider() -> LLMProvider:
             max_concurrency=endpoint.max_concurrency,
             extra_body=endpoint.extra_body,
             label=endpoint.display(),
+            quota_scope=endpoint.quota_scope,
+            json_mode=endpoint.json_mode,
         )
         # A fallback with no key is not a fallback. Left in, it declines on
         # every single call and is benched on every single pass — pure noise in

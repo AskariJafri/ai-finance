@@ -13,6 +13,7 @@ from app.schemas.chat import (
     ChatSendResponse,
     ChatSessionOut,
     ChatStatus,
+    LLMEndpointStatus,
 )
 from app.services.chat_service import DISCLAIMER
 
@@ -24,10 +25,15 @@ async def chat_status(user: CurrentUser, service: ChatServiceDep) -> ChatStatus:
     """Whether the assistant can answer, plus starter prompts for this user."""
     llm = get_chat_llm_provider()
     available = await llm.is_available() if settings.ai_available else False
+    # What the pool has learned from real calls. Labels only — the keys never
+    # leave the server.
+    pool_status = getattr(llm, "status", None)
+    endpoints = [LLMEndpointStatus(**m) for m in pool_status()] if callable(pool_status) else []
     return ChatStatus(
         ai_enabled=settings.ai_available,
         llm_available=available,
         model=getattr(llm, "model", None) if available else None,
+        endpoints=endpoints,
         suggestions=await service.suggestions(user.id),
         disclaimer=DISCLAIMER,
     )

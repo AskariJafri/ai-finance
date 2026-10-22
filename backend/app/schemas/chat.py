@@ -76,11 +76,19 @@ class ChatSuggestion(BaseModel):
     group: Literal["money", "invest", "learn"]
 
 
+class LLMEndpointStatus(BaseModel):
+    label: str
+    model: str | None = None
+    state: str  # ok | quota | rate_limited | model_gone | bad_key | transport | ...
+    retry_in: int = 0
+
+
 class ChatStatus(BaseModel):
     """What the client should expect before the user types anything."""
 
     ai_enabled: bool
     llm_available: bool
     model: str | None = None
+    endpoints: list[LLMEndpointStatus] = []
     suggestions: list[ChatSuggestion]
     disclaimer: str

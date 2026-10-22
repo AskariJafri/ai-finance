@@ -576,3 +576,133 @@ async def test_no_action_is_ever_zero_quantity(seeded_session):
             for a in plan.actions:
                 assert a.amount > 0, f"{sizing}/{verdict}: {a.symbol} has no value"
                 assert a.qty is None or a.qty > 0, f"{sizing}/{verdict}: {a.symbol} has qty {a.qty}"
+
+
+# --- second opinion on sells ------------------------------------------------
+class _Named(ScriptedLLM):
+    def __init__(self, model: str, by_symbol, default=("HOLD", 0.6)):
+        super().__init__(by_symbol, default)
+        self.model = model
+
+
+def _second_opinion_pool(second_says: str):
+    from app.ai.llm.pool import LLMPool
+
+    first = _Named("model-a", {"XEQT.TO": ("TRIM", 0.9)})
+    second = _Named("model-b", {"XEQT.TO": (second_says, 0.7)})
+    return LLMPool([first, second]), first, second
+
+
+async def _two_holdings(session):
+    user_id = await _user(session)
+    await _hold(session, user_id, "XEQT.TO", 10, 5_000)
+    await _hold(session, user_id, "ZAG.TO", 10, 5_000)
+    await _cash(session, user_id, 0)
+    return user_id
+
+
+@pytest.mark.asyncio
+async def test_a_trim_a_second_model_confirms_is_still_sold(seeded_session):
+    user_id = await _two_holdings(seeded_session)
+    pool, _, second = _second_opinion_pool("TRIM")
+
+    svc = PortfolioActionsService(seeded_session, FakeProvider(), pool)
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert [a.symbol for a in plan.actions if a.side == "sell"] == ["XEQT.TO"]
+    assert second.calls == 1, "only the trim is re-asked"
+
+
+@pytest.mark.asyncio
+async def test_a_trim_the_second_model_disputes_becomes_a_hold(seeded_session):
+    user_id = await _two_holdings(seeded_session)
+    pool, _, _ = _second_opinion_pool("HOLD")
+
+    svc = PortfolioActionsService(seeded_session, FakeProvider(), pool)
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert not [a for a in plan.actions if a.side == "sell"]
+    xeqt = next(h for h in plan.holds if h.symbol == "XEQT.TO")
+    assert "Models disagreed" in xeqt.reason
+
+
+@pytest.mark.asyncio
+async def test_no_second_opinion_without_a_second_model(seeded_session):
+    from app.ai.llm.pool import LLMPool
+
+    user_id = await _two_holdings(seeded_session)
+    only = _Named("model-a", {"XEQT.TO": ("TRIM", 0.9)})
+
+    svc = PortfolioActionsService(seeded_session, FakeProvider(), LLMPool([only]))
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert [a.symbol for a in plan.actions if a.side == "sell"] == ["XEQT.TO"]
+    assert only.calls == 2, "one call per holding, no re-ask of the same model"
+
+
+@pytest.mark.asyncio
+async def test_the_second_opinion_can_be_switched_off(seeded_session, monkeypatch):
+    monkeypatch.setattr(app_settings, "llm_second_opinion_on_sells", False)
+    user_id = await _two_holdings(seeded_session)
+    pool, _, second = _second_opinion_pool("HOLD")
+
+    svc = PortfolioActionsService(seeded_session, FakeProvider(), pool)
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert [a.symbol for a in plan.actions if a.side == "sell"] == ["XEQT.TO"]
+    assert second.calls == 0
+
+
+# --- saying why the AI was offline -------------------------------------------
+@pytest.mark.asyncio
+async def test_an_all_ai_plan_has_no_offline_note(seeded_session):
+    user_id = await _two_holdings(seeded_session)
+    svc = PortfolioActionsService(seeded_session, FakeProvider(), ScriptedLLM({}, ("HOLD", 0.6)))
+
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert plan.source == "ai"
+    assert plan.ai_note is None
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_plan_says_how_many_verdicts_fell_back(seeded_session):
+    class FlakyLLM(ScriptedLLM):
+        async def complete(self, prompt: str, **kwargs) -> str:
+            if "ZAG.TO" in prompt:
+                return _verdict("HOLD", 0.6)
+            raise RuntimeError("upstream overloaded")
+
+    user_id = await _two_holdings(seeded_session)
+    svc = PortfolioActionsService(seeded_session, FakeProvider(), FlakyLLM({}))
+
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert plan.source == "mixed"
+    assert "1 of 2 verdicts are rules-based" in plan.ai_note
+
+
+def test_the_note_names_spent_quotas_and_when_they_reset():
+    from app.services.portfolio_actions_service import ai_offline_note
+
+    def status():
+        return [
+            {"label": "a", "state": "quota", "retry_in": 3 * 3600},
+            {"label": "b", "state": "model_gone", "retry_in": 900},
+        ]
+
+    note = ai_offline_note(
+        "rules", [{"source": "rules"}], requested=True, configured=True, pool_status=status
+    )
+
+    assert "1 provider used up its free daily limit" in note
+    assert "1 provider has a model that no longer exists" in note
+    assert "~15 min" in note
+
+
+def test_the_note_says_when_no_key_is_configured():
+    from app.services.portfolio_actions_service import ai_offline_note
+
+    note = ai_offline_note("rules", [{"source": "rules"}], requested=True, configured=False)
+
+    assert "not configured" in note

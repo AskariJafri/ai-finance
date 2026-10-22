@@ -21,6 +21,11 @@ LLMFailureKind = Literal[
     "transport",
     "bad_key",
     "bad_response",
+    # The provider says the model does not exist (404, or a 400 naming an
+    # unknown or retired model). Free models are withdrawn without notice, and
+    # until this existed a retired primary looked like a 30-second blip and was
+    # re-dialled all day.
+    "model_gone",
     "unknown",
 ]
 

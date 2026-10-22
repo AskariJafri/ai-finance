@@ -457,6 +457,7 @@ async def run_committee_many(
     rules: dict[str, RulesVerdict] | None = None,
     market: MarketContext | None = None,
     portfolio: PortfolioBrief | None = None,
+    second_opinion: bool = False,
 ) -> list[dict]:
     """Deliberate over several tickers concurrently.
 
@@ -464,6 +465,10 @@ async def run_committee_many(
     ``rules_only`` for that symbol rather than losing the whole batch. One LLM
     call per ticker, and the provider caps how many are in flight at once — keep
     the list short anyway, since free tiers meter requests per day.
+
+    ``second_opinion`` re-asks a held TRIM of a different model before it
+    stands. Selling is the expensive mistake and there are only ever a few per
+    plan, so this is a handful of extra calls — see ``_confirm_trim``.
     """
 
     positions = held or {}
@@ -473,7 +478,7 @@ async def run_committee_many(
         position = positions.get(symbol)
         if use_ai:
             try:
-                return await run_committee(
+                result = await run_committee(
                     symbol,
                     quote,
                     ind,
@@ -483,11 +488,80 @@ async def run_committee_many(
                     market=market,
                     portfolio=portfolio,
                 )
+                if second_opinion and position is not None and _is_ai_trim(result):
+                    result = await _confirm_trim(
+                        result,
+                        llm,
+                        symbol,
+                        quote,
+                        ind,
+                        held=position,
+                        rules=verdicts.get(symbol),
+                        market=market,
+                        portfolio=portfolio,
+                    )
+                return result
             except Exception as exc:  # noqa: BLE001 — degrade this symbol only
                 logger.warning("Committee failed for %s, using rules: %s", symbol, exc)
         return rules_only(symbol, quote, ind, held=position is not None)
 
     return list(await asyncio.gather(*(one(s, q, i) for s, q, i in items)))
+
+
+def _is_ai_trim(result: dict) -> bool:
+    return result.get("source") == "ai" and result.get("action") == "TRIM"
+
+
+async def _confirm_trim(
+    result: dict,
+    llm: LLMProvider,
+    symbol: str,
+    quote: dict,
+    ind: Indicators,
+    **kwargs,
+) -> dict:
+    """Ask a different model the same held question; HOLD unless it agrees.
+
+    Read ``llm.model`` here, in the same task that just awaited the first
+    verdict: the pool records the answering model in a ContextVar, so this is
+    this ticker's answer and not a sibling's. A second opinion that cannot be
+    had (one live model, or it failed) leaves the first verdict alone — an
+    outage is not a disagreement.
+    """
+    alternate = getattr(llm, "alternate", None)
+    if not callable(alternate):
+        return result
+    first_model = getattr(llm, "model", None)
+    other = alternate(first_model)
+    if other is None:
+        return result
+    try:
+        check = await run_committee(symbol, quote, ind, other, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — no check is not a veto
+        logger.warning("Second opinion failed for %s: %s", symbol, exc)
+        return result
+    if check.get("source") != "ai":
+        return result
+    second_model = getattr(other, "model", None)
+    if check.get("action") == "TRIM":
+        return {
+            **result,
+            "second_opinion": {"model": second_model, "action": "TRIM", "agreed": True},
+        }
+    logger.info(
+        "Second opinion overrode a TRIM",
+        extra={"extra": {"symbol": symbol, "first": first_model, "second": second_model}},
+    )
+    return {
+        **result,
+        "action": "HOLD",
+        "confidence": round(min(float(result.get("confidence") or 0.5), 0.5), 2),
+        "summary": (
+            f"Models disagreed — holding. One said trim: {result['summary']} "
+            f"A second model said {str(check.get('action')).lower()}: {check.get('summary')}"
+        )[:500],
+        "second_opinion": {"model": second_model, "action": check.get("action"), "agreed": False},
+    }
 
 
 def source_of(results: list[dict]) -> str:

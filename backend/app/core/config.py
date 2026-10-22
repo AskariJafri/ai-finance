@@ -51,6 +51,16 @@ class LLMEndpoint(BaseModel):
     # a committee verdict costs 2,146 tokens at the default effort and 929 at
     # "low", for the same five seats and the same decision.
     extra_body: dict[str, Any] = Field(default_factory=dict)
+    # What the provider meters: the whole key ("key", OpenRouter's daily cap)
+    # or each model separately ("model", Groq and Cerebras). Unset means infer
+    # from the host. Getting this wrong in the "key" direction makes two Groq
+    # models share one breaker and one concurrency cap, so a second model adds
+    # no capacity at all.
+    quota_scope: Literal["key", "model"] | None = None
+    # Overrides LLM_JSON_MODE for this endpoint. Some models handle
+    # response_format badly — nemotron-3-ultra on OpenRouter sometimes returns
+    # only the first seat's object under it, and the whole verdict is lost.
+    json_mode: bool | None = None
 
     def display(self) -> str:
         return self.label or self.base_url
@@ -143,7 +153,7 @@ class Settings(BaseSettings):
     # Defaults target OpenRouter's free tier. Any OpenAI-compatible host works
     # by changing these three values — Groq, Cerebras, the Hugging Face router.
     llm_base_url: str = "https://openrouter.ai/api/v1"
-    llm_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
+    llm_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     llm_api_key: str = ""
     llm_timeout_seconds: float = 45.0
     # Free tiers cap requests per minute; the committee fans out over tickers
@@ -160,6 +170,11 @@ class Settings(BaseSettings):
     # app asks for and the reason this is not tighter.
     llm_max_tokens: int = 3500
     llm_json_mode: bool = True
+    # Extra request fields for the primary, as JSON — what `extra_body` is to a
+    # fallback. Reasoning models need it: nemotron-3-ultra at default effort
+    # spends ~1,300 hidden tokens and ~50s per committee call, past the socket
+    # timeout; {"reasoning":{"effort":"low"}} answers the same in ~10-20s.
+    llm_extra_body: Annotated[dict[str, Any], NoDecode] = Field(default_factory=dict)
     # Sent as HTTP-Referer / X-Title; OpenRouter uses them to attribute usage.
     llm_app_url: str = ""
     llm_app_title: str = "AI Personal Finance"
@@ -184,6 +199,9 @@ class Settings(BaseSettings):
     # and the shopping list is judged by nothing — which is how a plan ends up
     # all sells. Stage 2 still inherits whatever stage 1 leaves unspent.
     llm_held_budget_share: float = 0.6
+    # Re-ask a held TRIM of a different model before it stands; disagreement
+    # becomes HOLD. Sells are the costly mistakes and few per plan.
+    llm_second_opinion_on_sells: bool = True
     llm_wait_plan_seconds: float = 110.0
     llm_wait_analyze_seconds: float = 35.0
     llm_wait_narrative_seconds: float = 20.0
@@ -328,6 +346,23 @@ class Settings(BaseSettings):
         if "asyncpg" not in self.database_url:
             return False
         return (urlsplit(self.database_url).hostname or "") not in _LOCAL_HOSTS
+
+    @field_validator("llm_extra_body", mode="before")
+    @classmethod
+    def _parse_llm_extra_body(cls, value: object) -> object:
+        """Same reasoning as the fallbacks: a typo costs the tuning, not the boot."""
+        if not value or isinstance(value, dict):
+            return value or {}
+        try:
+            parsed = json.loads(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            logging.getLogger(__name__).warning(
+                "LLM_EXTRA_BODY is not a JSON object — ignoring it"
+            )
+            return {}
+        return parsed
 
     @field_validator("llm_fallbacks", mode="before")
     @classmethod

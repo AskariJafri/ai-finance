@@ -67,13 +67,53 @@ _DEFAULT_QUOTA_COOLDOWN = 900.0
 
 _limiters: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Semaphore] = {}
 
+# Hosts that meter each model on a key separately. On these a second model is a
+# second budget, so it must not share the first one's breaker or semaphore.
+_PER_MODEL_HOSTS = ("api.groq.com", "api.cerebras.ai")
 
-def _quota_key(base_url: str, api_key: str) -> str:
-    """Identity of the metered bucket: the credentials, not the model.
+# A 400 that means "no such model" rather than "bad request". Providers word it
+# differently ("model_not_found", "does not exist", "has been decommissioned"),
+# and only the body tells it apart from a malformed payload.
+_MODEL_GONE_RE = re.compile(
+    r"model[_\s-]?not[_\s-]?found|does not exist|decommissioned|"
+    r"no longer (?:supported|available)|not a valid model|invalid model|unknown model",
+    re.IGNORECASE,
+)
 
-    Two models on one key share a quota, so they share a breaker.
+
+def _quota_scope(base_url: str, scope: str | None) -> str:
+    if scope in ("key", "model"):
+        return scope
+    return "model" if any(host in base_url for host in _PER_MODEL_HOSTS) else "key"
+
+
+def _quota_key(base_url: str, api_key: str, model: str = "", scope: str | None = None) -> str:
+    """Identity of the metered bucket.
+
+    The credentials, plus the model on hosts that meter per model. Two models
+    on one OpenRouter key share a daily quota, so they share a breaker; two
+    models on one Groq key each have their own.
     """
+    if _quota_scope(base_url, scope) == "model":
+        return f"{base_url}|{api_key}|{model}"
     return f"{base_url}|{api_key}"
+
+
+def _error_message(resp) -> str:
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 — the status line is the message then
+        return resp.text[:200] if hasattr(resp, "text") else ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("code") or error)
+    return str(error or body)[:200]
+
+
+def _is_model_gone(resp) -> bool:
+    if resp.status_code == 404:
+        return True
+    return resp.status_code == 400 and bool(_MODEL_GONE_RE.search(_error_message(resp)))
 
 
 def _quota_cooldown_remaining(key: str) -> float:
@@ -167,6 +207,8 @@ class OpenAICompatProvider(LLMProvider):
         extra_body: dict | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         label: str = "",
+        quota_scope: str | None = None,
+        json_mode: bool | None = None,
     ) -> None:
         self.base_url = (base_url or settings.llm_base_url).rstrip("/")
         self.model = model or settings.llm_model
@@ -179,12 +221,13 @@ class OpenAICompatProvider(LLMProvider):
         # Per-endpoint because rate limits are per account — see `_limiter`.
         self.max_tokens = max_tokens or settings.llm_max_tokens
         self.max_concurrency = max_concurrency or settings.llm_max_concurrency
-        self.extra_body = dict(extra_body or {})
+        self.json_mode = settings.llm_json_mode if json_mode is None else json_mode
+        self.extra_body = dict(extra_body if extra_body is not None else settings.llm_extra_body)
         # Injected only by tests; production always builds a real transport.
         self._transport = transport
         # Which metered bucket this instance draws on. Computed once: it is the
         # key the breaker is stored under and the pool skips on.
-        self.quota_key = _quota_key(self.base_url, self.api_key)
+        self.quota_key = _quota_key(self.base_url, self.api_key, self.model, quota_scope)
         self._available_until = 0.0
         self._available = False
 
@@ -235,13 +278,19 @@ class OpenAICompatProvider(LLMProvider):
             # reply. OpenRouter can drop it server-side. Sent only there because
             # a stricter OpenAI-compatible server rejects unknown fields.
             payload["reasoning"] = {"exclude": True}
-        if json_object and settings.llm_json_mode:
+        if json_object and self.json_mode:
             payload["response_format"] = {"type": "json_object"}
         # Endpoint-specific extras last, so configuration can tune a provider
         # without a code change — but never the fields that define *what* is
         # being asked, which are this method's whole job.
         for key, value in self.extra_body.items():
-            if key not in ("model", "messages", "stream"):
+            if key in ("model", "messages", "stream"):
+                continue
+            if isinstance(value, dict) and isinstance(payload.get(key), dict):
+                # Merge, so {"reasoning": {"effort": "low"}} keeps the
+                # {"exclude": true} set above instead of replacing it.
+                payload[key] = {**payload[key], **value}
+            else:
                 payload[key] = value
         return payload
 
@@ -362,6 +411,25 @@ class OpenAICompatProvider(LLMProvider):
                     raise LLMUnavailable(
                         f"endpoint rejected the API key ({resp.status_code})",
                         kind="bad_key",
+                        endpoint=self.label,
+                    )
+
+                if _is_model_gone(resp):
+                    # Checked before the JSON-mode retry: a retired model would
+                    # otherwise be asked twice and then reported as a transport
+                    # blip. Logged as an error because it needs a config change,
+                    # not patience.
+                    detail = _error_message(resp)
+                    logger.error(
+                        "LLM model %r at %s is gone (%s): %s — update LLM_MODEL/LLM_FALLBACKS",
+                        self.model,
+                        self.base_url,
+                        resp.status_code,
+                        detail,
+                    )
+                    raise LLMUnavailable(
+                        f"model not available ({resp.status_code}): {detail}",
+                        kind="model_gone",
                         endpoint=self.label,
                     )
 

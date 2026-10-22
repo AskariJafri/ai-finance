@@ -569,6 +569,8 @@ class ActionPlanOut(BaseModel):
     passed: list[DeployPassedOut]
     considered: int
     source: str  # ai | mixed | rules
+    # Why the AI did not answer everything, in one line; None when it did.
+    ai_note: str | None = None
     note: str
     research: ResearchOut | None = None
     factors: FactorPlanOut | None = None

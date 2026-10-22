@@ -189,9 +189,10 @@ export function ActionsScreen() {
               <Text style={[styles.note, { color: theme.colors.textMuted }]}>{result.note}</Text>
               {result.source !== "ai" ? (
                 <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 8 }}>
-                  {result.source === "rules"
-                    ? "The model was unreachable — every verdict below is the rules-based read."
-                    : "Some verdicts fell back to the rules-based read; each one says which it is."}
+                  {result.ai_note ??
+                    (result.source === "rules"
+                      ? "The model was unreachable — every verdict below is the rules-based read."
+                      : "Some verdicts fell back to the rules-based read; each one says which it is.")}
                 </Text>
               ) : null}
             </Card>

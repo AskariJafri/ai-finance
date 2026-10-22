@@ -65,6 +65,9 @@ _BENCH_BY_KIND: dict[LLMFailureKind, float] = {
     # pool over a max_tokens mistake — so it sits out for no time at all and
     # costs one attempt instead.
     "bad_response": 0.0,
+    # The model was retired or never existed. Free models disappear without
+    # notice; re-dialling one every 30s spends a round trip per call all day.
+    "model_gone": 900.0,
     "unknown": _BENCH_SECONDS,
 }
 _RATE_LIMIT_BENCH_FLOOR = 5.0
@@ -108,6 +111,9 @@ class LLMPool(LLMProvider):
         # mutation is one element assignment, which the event loop cannot
         # interleave, and a lost update costs one extra round trip.
         self._benched_until = [0.0] * len(members)
+        # Why each member was last benched, for `status()`. Diagnostic only;
+        # nothing decides on it.
+        self._bench_kind: list[LLMFailureKind | None] = [None] * len(members)
 
     @property
     def model(self) -> str | None:
@@ -179,6 +185,7 @@ class LLMPool(LLMProvider):
 
                 # It answered, so whatever put it on the bench is over.
                 self._benched_until[index] = 0.0
+                self._bench_kind[index] = None
                 _answered_by.set(getattr(member, "model", None))
                 if index:
                     logger.info("LLM failed over to %s", _name(member))
@@ -225,6 +232,7 @@ class LLMPool(LLMProvider):
         if seconds <= 0:
             self._benched_until[index] = 0.0
             return None
+        self._bench_kind[index] = getattr(exc, "kind", "unknown")
         self._benched_until[index] = time.monotonic() + seconds
         return self._benched_until[index]
 
@@ -266,6 +274,61 @@ class LLMPool(LLMProvider):
                 continue
             live += 1
         return live
+
+    def alternate(self, exclude_model: str | None) -> LLMPool | None:
+        """A pool of the live members running a *different* model, or None.
+
+        For a second opinion: asking the same weights twice (even through a
+        different host — ``openai/gpt-oss-120b`` on Groq is ``gpt-oss-120b`` on
+        Cerebras) is a re-roll, not a check.
+        """
+        now = time.monotonic()
+        excluded = _model_family(exclude_model)
+        others: list[LLMProvider] = []
+        for index, member in enumerate(self.members):
+            if self._benched_until[index] > now:
+                continue
+            remaining = getattr(member, "quota_cooldown_remaining", None)
+            if callable(remaining) and remaining() > 0:
+                continue
+            if _model_family(getattr(member, "model", None)) == excluded:
+                continue
+            others.append(member)
+        return LLMPool(others) if others else None
+
+    def status(self) -> list[dict]:
+        """Each member's state, for diagnostics. No network calls.
+
+        ``state`` is ``ok``, ``quota`` (daily allowance spent), or the failure
+        kind that benched it (``bad_key``, ``model_gone``, ``rate_limited``…).
+        ``retry_in`` is whole seconds until it is worth asking again.
+        """
+        now = time.monotonic()
+        out: list[dict] = []
+        for index, member in enumerate(self.members):
+            remaining = getattr(member, "quota_cooldown_remaining", None)
+            quota = remaining() if callable(remaining) else 0.0
+            bench = max(0.0, self._benched_until[index] - now)
+            if quota > 0:
+                state, wait = "quota", max(quota, bench)
+            elif bench > 0:
+                state, wait = str(self._bench_kind[index] or "benched"), bench
+            else:
+                state, wait = "ok", 0.0
+            out.append(
+                {
+                    "label": _name(member),
+                    "model": getattr(member, "model", None),
+                    "state": state,
+                    "retry_in": math.ceil(wait),
+                }
+            )
+        return out
+
+
+def _model_family(model: str | None) -> str:
+    """``openai/gpt-oss-120b:free`` -> ``gpt-oss-120b``: the weights, not the host."""
+    return (model or "").lower().rsplit("/", 1)[-1].split(":", 1)[0]
 
 
 def _name(member: LLMProvider) -> str:

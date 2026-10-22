@@ -68,3 +68,13 @@ async def test_secret_is_encrypted_at_rest(client: AsyncClient, sessionmaker):
         row = (await session.execute(select(PlaidCredential))).scalar_one()
         assert row.secret_encrypted != "plaintext-secret"
         assert "plaintext-secret" not in row.secret_encrypted
+
+
+def test_a_malformed_llm_extra_body_is_ignored_not_fatal(monkeypatch):
+    from app.core.config import Settings
+
+    monkeypatch.setenv("LLM_EXTRA_BODY", "{reasoning:{effort:low}}")
+    assert Settings(_env_file=None).llm_extra_body == {}
+
+    monkeypatch.setenv("LLM_EXTRA_BODY", '{"reasoning":{"effort":"low"}}')
+    assert Settings(_env_file=None).llm_extra_body == {"reasoning": {"effort": "low"}}
