@@ -145,7 +145,15 @@ class LLMPool(LLMProvider):
             retry_now = False
             out_of_time = False
 
-            for index, member in enumerate(self.members):
+            # Order is preference, not a queue. A fan-out used to line up
+            # every call behind the primary's semaphore — a ~20s free model —
+            # while sub-second fallbacks sat idle because nothing had
+            # *failed*. So members with a free slot go first, in preference
+            # order, and a busy one is still tried after them in the same
+            # pass: it queues only when nothing idle could answer.
+            order = sorted(range(len(self.members)), key=lambda i: _saturated(self.members[i]))
+            for index in order:
+                member = self.members[index]
                 now = time.monotonic()
                 if self._benched_until[index] > now:
                     soonest = min(soonest, self._benched_until[index])
@@ -155,7 +163,6 @@ class LLMPool(LLMProvider):
                 if budget.deadline is not None and budget.deadline - now < _MIN_USEFUL:
                     out_of_time = True
                     break
-
                 attempts[index] += 1
                 try:
                     answer = await member.complete(
@@ -324,6 +331,17 @@ class LLMPool(LLMProvider):
                 }
             )
         return out
+
+
+def _saturated(member: LLMProvider) -> bool:
+    """Members without a concurrency cap (test fakes, other providers) never are."""
+    check = getattr(member, "saturated", None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check())
+    except Exception:  # noqa: BLE001 — a routing hint must not fail the call
+        return False
 
 
 def _model_family(model: str | None) -> str:

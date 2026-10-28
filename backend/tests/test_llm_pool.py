@@ -245,3 +245,37 @@ def test_extra_body_cannot_rewrite_what_is_being_asked():
     assert payload["model"] == "the-real-model"
     assert payload["messages"][0]["content"] == "hi"
     assert payload["stream"] is False
+
+
+# --- overflow --------------------------------------------------------------
+class Busy(Member):
+    """A member whose concurrency slots are all taken."""
+
+    def saturated(self) -> bool:
+        return True
+
+
+async def test_a_busy_preferred_member_overflows_to_an_idle_one():
+    """Waiting in line for a slow primary while a fallback sits idle is how a
+    plan came to take minutes with nothing having failed."""
+    busy = Busy("busy", answer="from busy")
+    idle = Member("idle", answer="from idle")
+
+    assert await LLMPool([busy, idle]).complete("hi") == "from idle"
+    assert busy.calls == 0
+
+
+async def test_when_every_member_is_busy_the_preferred_one_is_waited_on():
+    first = Busy("first", answer="from first")
+    second = Busy("second", answer="from second")
+
+    assert await LLMPool([first, second]).complete("hi") == "from first"
+    assert second.calls == 0
+
+
+async def test_a_busy_member_is_still_tried_when_the_idle_ones_decline():
+    busy = Busy("busy", answer="from busy")
+    idle_but_down = Member("down")
+
+    assert await LLMPool([busy, idle_but_down]).complete("hi") == "from busy"
+    assert idle_but_down.calls == 1

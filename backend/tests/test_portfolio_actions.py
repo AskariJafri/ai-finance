@@ -9,6 +9,7 @@ Those are the properties that make a plan safe to act on.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date, timedelta
 
@@ -606,7 +607,7 @@ async def test_a_trim_a_second_model_confirms_is_still_sold(seeded_session):
     user_id = await _two_holdings(seeded_session)
     pool, _, second = _second_opinion_pool("TRIM")
 
-    svc = PortfolioActionsService(seeded_session, FakeProvider(), pool)
+    svc = PortfolioActionsService(seeded_session, _SteadyProvider(), pool)
     plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
 
     assert [a.symbol for a in plan.actions if a.side == "sell"] == ["XEQT.TO"]
@@ -618,12 +619,45 @@ async def test_a_trim_the_second_model_disputes_becomes_a_hold(seeded_session):
     user_id = await _two_holdings(seeded_session)
     pool, _, _ = _second_opinion_pool("HOLD")
 
-    svc = PortfolioActionsService(seeded_session, FakeProvider(), pool)
+    svc = PortfolioActionsService(seeded_session, _SteadyProvider(), pool)
     plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
 
     assert not [a for a in plan.actions if a.side == "sell"]
     xeqt = next(h for h in plan.holds if h.symbol == "XEQT.TO")
     assert "Models disagreed" in xeqt.reason
+
+
+class _SteadyProvider(FakeProvider):
+    """An uptrend with pullbacks (RSI ~65), so the rules say hold — the case
+    where a TRIM is the model's call alone and a second opinion applies."""
+
+    async def get_bars(self, symbol: str, start: date, end: date) -> list[BarPoint]:
+        if symbol.upper() == "USDCAD=X":
+            return await super().get_bars(symbol, start, end)
+        return [BarPoint(start + timedelta(days=i), 100.0 + 0.3 * i + (i % 2)) for i in range(60)]
+
+
+class _FallingProvider(FakeProvider):
+    """A broken trend, so the pre-committed rules say sell."""
+
+    async def get_bars(self, symbol: str, start: date, end: date) -> list[BarPoint]:
+        if symbol.upper() == "USDCAD=X":
+            return await super().get_bars(symbol, start, end)
+        return [BarPoint(start + timedelta(days=i), 200.0 - i) for i in range(60)]
+
+
+@pytest.mark.asyncio
+async def test_a_trim_the_rules_also_call_for_is_not_put_to_a_vote(seeded_session):
+    """Rules and model agreeing is already two signals; re-asking handed the
+    veto to the most HOLD-inclined model and the plan never sold anything."""
+    user_id = await _two_holdings(seeded_session)
+    pool, _, second = _second_opinion_pool("HOLD")
+
+    svc = PortfolioActionsService(seeded_session, _FallingProvider(), pool)
+    plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=0))
+
+    assert [a.symbol for a in plan.actions if a.side == "sell"] == ["XEQT.TO"]
+    assert second.calls == 0
 
 
 @pytest.mark.asyncio
@@ -706,3 +740,39 @@ def test_the_note_says_when_no_key_is_configured():
     note = ai_offline_note("rules", [{"source": "rules"}], requested=True, configured=False)
 
     assert "not configured" in note
+
+
+# --- latency ---------------------------------------------------------------
+class _Overlapping(ScriptedLLM):
+    """Records the most calls ever in flight at once."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.in_flight = 0
+        self.peak = 0
+
+    async def complete(self, prompt: str, **kwargs) -> str:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0.05)
+            return await super().complete(prompt, **kwargs)
+        finally:
+            self.in_flight -= 1
+
+
+@pytest.mark.asyncio
+async def test_holdings_and_candidates_are_judged_concurrently(seeded_session):
+    """A plan used to cost the sum of two fan-outs; it should cost the slower."""
+    user_id = await _user(seeded_session)
+    await _hold(seeded_session, user_id, "XEQT.TO", 10, 5_000)
+    await _cash(seeded_session, user_id, 1_000)
+
+    llm = _Overlapping({"XEQT.TO": ("HOLD", 0.7)}, default=("SKIP", 0.6))
+    plan = await PortfolioActionsService(seeded_session, FakeProvider(), llm).plan(
+        user_id, ActionPlanIn(max_candidates=2)
+    )
+
+    assert llm.calls == 3  # one holding, two candidates
+    assert llm.peak == 3, "the holding was judged before the candidates started"
+    assert [h.symbol for h in plan.holds] == ["XEQT.TO"]

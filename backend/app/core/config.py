@@ -192,13 +192,8 @@ class Settings(BaseSettings):
     # screen (mobile/src/api/hooks.ts) — a budget that outlives the client is
     # spent producing an answer nobody receives. Actions 300s, Deploy 180s,
     # the rest 60s, so each of these sits comfortably inside its pair.
+    # The holdings and candidate stages run concurrently, each on this deadline.
     llm_wait_actions_seconds: float = 150.0
-    # How much of the actions budget the holdings stage may spend before the
-    # candidate stage's reserved share begins. Holdings are judged first, so
-    # without a cap they take the whole allowance on a rate-limited endpoint
-    # and the shopping list is judged by nothing — which is how a plan ends up
-    # all sells. Stage 2 still inherits whatever stage 1 leaves unspent.
-    llm_held_budget_share: float = 0.6
     # Re-ask a held TRIM of a different model before it stands; disagreement
     # becomes HOLD. Sells are the costly mistakes and few per plan.
     llm_second_opinion_on_sells: bool = True

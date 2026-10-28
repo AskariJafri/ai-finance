@@ -466,6 +466,12 @@ class OpenAICompatProvider(LLMProvider):
         without a round trip, and so tests need not reach into module state."""
         return _quota_cooldown_remaining(self.quota_key)
 
+    def saturated(self) -> bool:
+        """True when every concurrency slot on this account is in use, so a new
+        call would queue behind the ones in flight. The pool reads it to send
+        overflow to an idle member instead of waiting on a slow one."""
+        return _limiter(self.quota_key, self.max_concurrency).locked()
+
     # --- health -----------------------------------------------------------
 
     async def is_available(self) -> bool:

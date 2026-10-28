@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from app.ai.committee import COMMITTEE_SYSTEM, _context, run_committee
+from app.ai.committee import COMMITTEE_SYSTEM, HELD_SYSTEM, _context, run_committee
 from app.analytics.decision_context import (
     MacroBrief,
     MarketContext,
@@ -170,6 +170,15 @@ def test_the_system_prompt_states_the_veto_asymmetry():
 
 def test_the_figures_invariant_survives_scoped_rather_than_dropped():
     assert "Never invent, estimate or recompute a figure" in COMMITTEE_SYSTEM
+
+
+def test_the_system_prompt_does_not_default_every_answer_to_inaction():
+    """ "When uncertain, SKIP" on top of "default to HOLD" on top of a rules gate
+    made the planner answer HOLD/SKIP to everything, buys the rules engine
+    flagged included. Generic volatility must not be a reason on its own."""
+    assert "when uncertain, SKIP" not in COMMITTEE_SYSTEM
+    assert "NOT on their own reasons to SKIP" in COMMITTEE_SYSTEM
+    assert "HOLD is a decision, not a safe harbour" in HELD_SYSTEM
 
 
 # --- news_weight ------------------------------------------------------------

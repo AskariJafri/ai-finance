@@ -32,8 +32,9 @@ number. Nothing here may set APPROVED: ``propose`` persists nothing at all, and
 
 from __future__ import annotations
 
-import time
+import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -138,6 +139,23 @@ class _Sized:
     factors: FactorPlanOut | None = None
 
 
+@dataclass
+class _Stage:
+    """A judging stage with its database work done and its committee call not
+    yet made. Split so the two stages' LLM fan-outs can run concurrently while
+    everything touching the shared session stays sequential."""
+
+    items: list[tuple[str, dict, Indicators]]
+    options: dict
+    #: Turns the committee's results into what the stage returns.
+    finish: Callable[[list[dict]], tuple]
+
+    @classmethod
+    def done(cls, value: tuple) -> _Stage:
+        """A stage with nothing to ask — its answer is already known."""
+        return cls(items=[], options={}, finish=lambda _results: value)
+
+
 class PortfolioActionsService:
     def __init__(
         self,
@@ -220,39 +238,21 @@ class PortfolioActionsService:
         # Both stages append into one dict, the same way they already append
         # into `passed`, so the response can report the research as a whole.
         researched: dict[str, SymbolNews] = {}
-        # One request-wide allowance, but split rather than shared first-come.
+        # Both stages' database and market-data work runs first, in order —
+        # they share one AsyncSession, which two tasks must not use at once.
+        # Only the committee calls themselves run concurrently.
         #
-        # The two stages used to sit inside a single budget, and because
-        # holdings are judged first they spent it: waiting out a rate limit on
-        # a position left the shopping list with an expired deadline, so every
-        # candidate fell back to rules and the signal-quality rule below then
-        # declined to fund them. The plan that came back was sells and nothing
-        # else — not because there was nothing worth buying, but because the
-        # buy side was always the half that ran second.
-        #
-        # So stage 1 is capped at its share and stage 2 gets everything left
-        # over, floored at the share reserved for it. The total is unchanged;
-        # what changes is that the shopping list can no longer be starved by
-        # the stage in front of it.
-        total_wait = settings.llm_wait_actions_seconds
-        reserved = total_wait * (1.0 - settings.llm_held_budget_share)
-        started = time.monotonic()
-        with llm_budget(
-            wait=total_wait * settings.llm_held_budget_share,
-            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
-            max_output_tokens=settings.llm_committee_max_tokens,
-        ):
-            held_results, held_prices, held_names = await self._judge_held(
-                held, passed, use_ai, macro, researched, brief
-            )
-        with llm_budget(
-            wait=max(total_wait - (time.monotonic() - started), reserved),
-            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
-            max_output_tokens=settings.llm_committee_max_tokens,
-        ):
-            candidates, considered = await self._judge_candidates(
-                user_id, body, passed, use_ai, macro, researched, brief
-            )
+        # They used to run one after the other inside a split budget, so a plan
+        # cost the sum of two fan-outs. Run together, it costs the slower one,
+        # and neither stage can starve the other of time: each gets the whole
+        # allowance on its own deadline.
+        held_stage = await self._judge_held(held, passed, use_ai, macro, researched, brief)
+        cand_stage = await self._judge_candidates(
+            user_id, body, passed, use_ai, macro, researched, brief
+        )
+        (held_results, held_prices, held_names), (candidates, considered) = await asyncio.gather(
+            self._run_stage(held_stage, use_ai), self._run_stage(cand_stage, use_ai)
+        )
         # Each verdict degrades on its own, so "the AI ran" is not a property of
         # the request — it is a count of which ones actually came back. Saying
         # "ai" over a plan that is mostly rules would overstate it.
@@ -361,7 +361,7 @@ class PortfolioActionsService:
         macro: MacroBrief | None = None,
         researched: dict[str, SymbolNews] | None = None,
         brief: PortfolioBrief | None = None,
-    ) -> tuple[dict[str, dict], dict[str, float], dict[str, str | None]]:
+    ) -> _Stage:
         """Committee verdict on the held positions, largest first.
 
         Held positions are never shortlisted *away* — a plan that silently
@@ -377,7 +377,7 @@ class PortfolioActionsService:
         """
         symbols = sorted(held, key=lambda s: held[s].get("weight", 0.0), reverse=True)
         if not symbols:
-            return {}, {}, {}
+            return _Stage.done(({}, {}, {}))
 
         if len(symbols) > settings.max_held_judged:
             for symbol in symbols[settings.max_held_judged :]:
@@ -414,7 +414,7 @@ class PortfolioActionsService:
         quoted, unpriced = await self.deploy._quote(scored)
         passed.extend(unpriced)
         if not quoted:
-            return {}, {}, {}
+            return _Stage.done(({}, {}, {}))
 
         # The seats are told this is already owned — and judge TRIM/HOLD/ADD
         # rather than BUY/SKIP/HOLD, because "I would not open this today" is
@@ -445,20 +445,20 @@ class PortfolioActionsService:
                 stale_symbols=tuple(stale),
             )
 
-        results = await run_committee_many(
-            [(sym, quote, ind) for sym, quote, ind, _ in quoted],
-            self.llm,
-            use_ai=use_ai,
-            held=contexts,
-            rules={sym: rules_verdict(ind, held=True) for sym, _, ind, _ in quoted},
-            market=market,
-            portfolio=brief,
-            second_opinion=settings.llm_second_opinion_on_sells,
-        )
-        return (
-            {r["symbol"]: r for r in results},
-            {sym: price for sym, _, _, price in quoted},
-            {sym: quote.get("name") for sym, quote, _, _ in quoted},
+        return _Stage(
+            items=[(sym, quote, ind) for sym, quote, ind, _ in quoted],
+            options={
+                "held": contexts,
+                "rules": {sym: rules_verdict(ind, held=True) for sym, _, ind, _ in quoted},
+                "market": market,
+                "portfolio": brief,
+                "second_opinion": settings.llm_second_opinion_on_sells,
+            },
+            finish=lambda results: (
+                {r["symbol"]: r for r in results},
+                {sym: price for sym, _, _, price in quoted},
+                {sym: quote.get("name") for sym, quote, _, _ in quoted},
+            ),
         )
 
     # --- stage 2: what you could own instead ---
@@ -471,14 +471,14 @@ class PortfolioActionsService:
         macro: MacroBrief | None = None,
         researched: dict[str, SymbolNews] | None = None,
         brief: PortfolioBrief | None = None,
-    ) -> tuple[list[dict], int]:
+    ) -> _Stage:
         """Rank the unheld universe for free, then spend calls on the top few."""
         if body.max_new_positions == 0:
-            return [], 0
+            return _Stage.done(([], 0))
 
         pool = await self.deploy._candidate_pool(user_id)
         if not pool:
-            return [], 0
+            return _Stage.done(([], 0))
 
         await self.market_data.sync_bars(pool)
         await self.session.commit()
@@ -486,12 +486,12 @@ class PortfolioActionsService:
         ranked, unpriced = await self.deploy._rank(pool)
         passed.extend(unpriced)
         if not ranked:
-            return [], len(pool)
+            return _Stage.done(([], len(pool)))
 
         quoted, no_quote = await self.deploy._quote(ranked[: body.max_candidates])
         passed.extend(no_quote)
         if not quoted:
-            return [], len(pool)
+            return _Stage.done(([], len(pool)))
 
         # Shortlist only — `pool` above may be ~65 names, `quoted` is at most
         # max_candidates. Fetching news for the pool is what this staging exists
@@ -510,20 +510,37 @@ class PortfolioActionsService:
                 stale_symbols=tuple(stale),
             )
 
-        results = await run_committee_many(
-            [(sym, quote, ind) for sym, quote, ind, _ in quoted],
-            self.llm,
-            use_ai=use_ai,
-            rules={sym: rules_verdict(ind, held=False) for sym, _, ind, _ in quoted},
-            market=market,
-            portfolio=brief,
-        )
         prices = {sym: price for sym, _, _, price in quoted}
         names = {sym: quote.get("name") for sym, quote, _, _ in quoted}
-        enriched = []
-        for r in results:
-            enriched.append({**r, "price_cad": prices[r["symbol"]], "name": names.get(r["symbol"])})
-        return enriched, len(pool)
+        return _Stage(
+            items=[(sym, quote, ind) for sym, quote, ind, _ in quoted],
+            options={
+                "rules": {sym: rules_verdict(ind, held=False) for sym, _, ind, _ in quoted},
+                "market": market,
+                "portfolio": brief,
+            },
+            finish=lambda results: (
+                [
+                    {**r, "price_cad": prices[r["symbol"]], "name": names.get(r["symbol"])}
+                    for r in results
+                ],
+                len(pool),
+            ),
+        )
+
+    async def _run_stage(self, stage: _Stage, use_ai: bool):
+        """The committee call a stage prepared, on its own deadline."""
+        if not stage.items:
+            return stage.finish([])
+        with llm_budget(
+            wait=settings.llm_wait_actions_seconds,
+            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
+            max_output_tokens=settings.llm_committee_max_tokens,
+        ):
+            results = await run_committee_many(
+                stage.items, self.llm, use_ai=use_ai, **stage.options
+            )
+        return stage.finish(results)
 
     # --- stage 3: verdicts -> orders against one budget ---
     def _size(
