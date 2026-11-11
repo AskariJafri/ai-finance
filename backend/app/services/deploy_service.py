@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -138,6 +138,9 @@ class DeployService:
         self.holdings = HoldingRepository(session)
         self.watchlist = WatchlistRepository(session)
         self.proposals = ProposedOrderRepository(session)
+        # Set by a caller that has resolved the user's brokerage link (see
+        # live_quotes.broker_quote_fetcher). None means market data only.
+        self.live_quotes = None
 
     # --- planning (read-only: persists nothing) ---
     async def plan(self, user_id: uuid.UUID, body: DeployPlanIn) -> DeployPlanOut:
@@ -206,7 +209,9 @@ class DeployService:
                 [(sym, quote, ind) for sym, quote, ind, _ in quoted],
                 self.llm,
                 use_ai=use_ai,
-                rules={sym: rules_verdict(ind, held=False) for sym, _, ind, _ in quoted},
+                rules={
+                    sym: rules_verdict(ind, held=False, symbol=sym) for sym, _, ind, _ in quoted
+                },
                 market=market,
             )
         # Derived from the verdicts that actually came back, not from the gate
@@ -245,15 +250,19 @@ class DeployService:
         return pool
 
     async def _rank(
-        self, pool: list[str]
+        self, pool: list[str], *, before: date | None = None
     ) -> tuple[list[tuple[float, str, Indicators, str]], list[DeployPassedOut]]:
-        """Stage 1 — score every candidate on cached bars. Zero LLM calls."""
+        """Stage 1 — score every candidate on cached bars. Zero LLM calls.
+
+        ``before`` restricts the signal to sessions completed before that day,
+        so a ranking does not drift with today's still-moving bar."""
         series = await self.market_data.get_close_series(pool)
         ranked: list[tuple[float, str, Indicators, str]] = []
         passed: list[DeployPassedOut] = []
 
         for symbol in pool:
-            closes = [c for _, c in series.get(symbol, [])]
+            bars = series.get(symbol, [])
+            closes = [c for d, c in bars if before is None or d < before] or [c for _, c in bars]
             try:
                 ind = compute_indicators(closes)
             except ValueError:
@@ -265,7 +274,7 @@ class DeployService:
                     )
                 )
                 continue
-            score, action, _ = signal_for(ind, held=False)
+            score, action, _ = signal_for(ind, held=False, symbol=symbol)
             ranked.append((score, symbol, ind, action))
 
         # Anything the pre-committed rules would actually buy outranks a
@@ -286,7 +295,19 @@ class DeployService:
         symbols = [symbol for _, symbol, _, _ in finalists]
         indicators = {symbol: ind for _, symbol, ind, _ in finalists}
 
+        # The user's broker first, when a planner has wired one in: a real-time
+        # quote under the broker's licence. Whatever it can't price falls
+        # through to the market-data provider, fetched fresh.
+        broker: dict = {}
+        if self.live_quotes is not None:
+            try:
+                broker = await self.live_quotes(symbols)
+            except Exception as exc:  # noqa: BLE001 — fall back, never fail the plan
+                logger.warning("Broker quotes failed, using market data: %s", exc)
+
         async def one(symbol: str):
+            if symbol.upper() in broker:
+                return symbol, broker[symbol.upper()], None
             try:
                 return symbol, await self.provider.get_quote(symbol), None
             except MarketDataError as exc:
@@ -327,6 +348,10 @@ class DeployService:
                         "price": round(quote.price, 4),
                         "currency": quote.currency,
                         "name": quote.name,
+                        "source": getattr(quote, "source", "yahoo"),
+                        # The exchange's timestamp when the provider gives
+                        # one; otherwise the moment we fetched it.
+                        "as_of": (getattr(quote, "as_of", None) or datetime.now(UTC)).isoformat(),
                     },
                     indicators[symbol],
                     price_cad,

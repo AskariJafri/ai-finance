@@ -271,6 +271,8 @@ class OpenAICompatProvider(LLMProvider):
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if settings.llm_seed and temperature == 0:
+            payload["seed"] = settings.llm_seed
         if "openrouter.ai" in self.base_url:
             # Reasoning models bill their scratchpad against max_tokens, and a
             # long one can consume the whole budget before the answer starts —

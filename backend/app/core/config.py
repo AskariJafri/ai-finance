@@ -197,6 +197,14 @@ class Settings(BaseSettings):
     # Re-ask a held TRIM of a different model before it stands; disagreement
     # becomes HOLD. Sells are the costly mistakes and few per plan.
     llm_second_opinion_on_sells: bool = True
+    # Sent as the OpenAI-standard ``seed`` so a provider that honours it
+    # (OpenAI, Groq, OpenRouter, Cerebras) samples the same way every time.
+    # Together with temperature 0 this is best-effort determinism; the
+    # per-day verdict cache is what actually guarantees it. 0 disables.
+    llm_seed: int = 7
+    # How long a plan that is still "running" may go without finishing before
+    # it is treated as dead (server restarted mid-run) and can be retried.
+    action_run_stale_seconds: int = 480
     llm_wait_plan_seconds: float = 110.0
     llm_wait_analyze_seconds: float = 35.0
     llm_wait_narrative_seconds: float = 20.0

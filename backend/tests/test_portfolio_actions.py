@@ -52,6 +52,40 @@ class FakeProvider:
         return [BarPoint(start + timedelta(days=i), 100.0 + i) for i in range(60)]
 
 
+class SignalProvider(FakeProvider):
+    """Three hundred sessions of realistic, noisy prices, anchored to ``end``.
+
+    FakeProvider's straight 60-day ramp is too short for the long-horizon
+    signal, and two syncs over different windows stitch it into a sawtooth
+    that reads as a 40% crash. Here price is a function of the day's distance
+    from ``end``, so overlapping syncs agree. Symbols in ``declining`` drift
+    down about 12% a year; everything else drifts up about 24%. Both carry
+    ~15% annualised noise.
+    """
+
+    SESSIONS = 300
+
+    def __init__(self, declining: set[str] | frozenset[str] = frozenset()):
+        self.declining = {s.upper() for s in declining}
+
+    async def get_bars(self, symbol: str, start: date, end: date) -> list[BarPoint]:
+        import math
+
+        first = max(start, end - timedelta(days=self.SESSIONS - 1))
+        days = (end - first).days + 1
+        if days <= 0:
+            return []
+        if symbol.upper() == "USDCAD=X":
+            return [BarPoint(first + timedelta(days=i), 1.4) for i in range(days)]
+        drift = -0.0004 if symbol.upper() in self.declining else 0.0008
+        out = []
+        for i in range(days):
+            d = first + timedelta(days=i)
+            k = self.SESSIONS - 1 - (end - d).days  # 0..SESSIONS-1, fixed per date
+            out.append(BarPoint(d, 100.0 * (1 + drift * k) * (1 + 0.01 * math.sin(1.3 * k))))
+        return out
+
+
 def _verdict(action: str, confidence: float) -> str:
     agents = ", ".join(
         f'{{"agent":"{key}","stance":"neutral","confidence":0.6,"thesis":"A view."}}'
@@ -450,7 +484,9 @@ async def test_an_ai_sell_is_never_redeployed_into_a_rules_only_buy(seeded_sessi
     await _hold(seeded_session, user_id, "XEQT.TO", 10, 5_000)
     await _cash(seeded_session, user_id, 0)
 
-    svc = PortfolioActionsService(seeded_session, FakeProvider(), HalfUpLLM({}))
+    svc = PortfolioActionsService(
+        seeded_session, SignalProvider(declining={"ZAG.TO", "XEQT.TO"}), HalfUpLLM({})
+    )
     plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=3))
 
     # ZAG was sold on a committee verdict; XEQT is trimmed by the concentration

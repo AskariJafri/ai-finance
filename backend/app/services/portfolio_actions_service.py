@@ -36,7 +36,7 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,11 +51,21 @@ from app.analytics.decision_context import (
     SymbolNews,
 )
 from app.analytics.indicators import Indicators, compute_indicators
+from app.analytics.quant_signals import (
+    EXIT_SCORE,
+    alpha_weight,
+    is_broad_fund,
+    reconcile,
+    vol_capped_weight,
+)
 from app.core.config import settings
+from app.core.crypto import TokenCipher
 from app.core.logging import get_logger
 from app.db.models import ProposedOrder
 from app.domain.enums import OrderSide
 from app.integrations.marketdata.provider import MarketDataProvider
+from app.integrations.snaptrade.gateway import SnapTradeGateway
+from app.repositories.action_runs import VerdictCacheRepository, market_period
 from app.repositories.holdings import HoldingRepository
 from app.repositories.proposed_orders import ProposedOrderRepository
 from app.schemas.common import cents_to_dollars
@@ -76,6 +86,7 @@ from app.services.autotrader_service import rules_verdict
 from app.services.deploy_service import CONCENTRATION_CAP, DeployService
 from app.services.errors import ValidationFailed
 from app.services.invest_service import InvestService, order_out
+from app.services.live_quotes import broker_quote_fetcher
 from app.services.market_context_service import MarketContextService, research_out
 from app.services.market_data_service import FX_SYMBOL, MarketDataService
 
@@ -91,6 +102,14 @@ MIN_TRADE_CAD = 20.0
 # unsure is itself a reason not to act on the whole position at once.
 FULL_EXIT_CONFIDENCE = 0.75
 PARTIAL_TRIM_FRACTION = 0.5
+# A trim the committee wanted but the signal only called a hold: a smaller
+# step, since the two disagree about how urgent it is.
+OVERLAY_TRIM_FRACTION = 1 / 3
+
+# Rebalancing band. A held name is trimmed back to its risk-based ceiling only
+# once it has drifted this far past it (25% relative, the "5/25" threshold
+# rule), so normal day-to-day drift never generates a trade.
+REBALANCE_BAND = 1.25
 
 # Cash kept back rather than deployed to the last cent — an account with no cash
 # at all cannot act on anything next month without selling first.
@@ -126,6 +145,137 @@ def _limits() -> factor_limits.Limits:
     )
 
 
+def completed_closes(bars: list[tuple[date, float]], period: date) -> list[float]:
+    """Closes from sessions that finished before ``period``.
+
+    Today's bar is a live snapshot while the market is open. Feeding it to the
+    signal made the verdict at 10am differ from the one at 2pm for no reason
+    a person would recognise. Falls back to every bar when that would leave
+    nothing (a listing whose only data is today's).
+    """
+    done = [c for d, c in bars if d < period]
+    return done or [c for _, c in bars]
+
+
+def anchor_to_signal(result: dict, ind: Indicators | None, *, held: bool) -> dict:
+    """Fix a committee verdict to the house signal, within one notch.
+
+    The signal is computed from completed closes, so it is the same all day.
+    The committee's verdict stands when it is within one step of it (a hold
+    the signal calls an add, say); further than that, or against a hard rule
+    like the trailing stop, the signal's side wins and the summary says why.
+    A rules fallback simply becomes the signal's verdict.
+    """
+    signal = ind.signal if ind is not None else None
+    if signal is None:
+        return result
+    symbol = str(result.get("symbol") or "")
+    quant = signal.decide(held=held, symbol=symbol)
+    said = str(result.get("action") or "").upper()
+    ai_conf = float(result.get("confidence") or 0.5)
+    summary = str(result.get("summary") or "").strip()
+
+    if result.get("source") == "ai":
+        final, why = reconcile(quant, said, signal, held=held, symbol=symbol)
+    else:
+        final, why = quant, None
+
+    if why:
+        confidence = signal.confidence(final)
+        summary = (
+            f"{final.title()} — {why}. The committee said {said.lower()}: {summary}"
+            if summary
+            else f"{final.title()} — {why}."
+        )
+    elif final == quant:
+        # Two independent reads agreeing: average them.
+        confidence = round((signal.confidence(final) + ai_conf) / 2, 2)
+    else:
+        # The committee's one-step adjustment. Never more sure than the
+        # signal would be of its own call — they disagree.
+        confidence = round(min(ai_conf, 0.7), 2)
+    if result.get("source") != "ai":
+        summary = f"Rules-based read ({signal.line()}); AI offline."
+
+    return {
+        **result,
+        "action": final,
+        "confidence": confidence,
+        "summary": summary[:500],
+        "signal": signal.as_dict(),
+        "signal_line": signal.line(),
+        "signal_action": quant,
+        "committee_action": said,
+    }
+
+
+def _with_signals(
+    actions: list[ActionOut], holds: list[ActionHoldOut], verdicts: list[dict]
+) -> tuple[list[ActionOut], list[ActionHoldOut]]:
+    """Stamp each line of the plan with the signal it was anchored to."""
+    by_symbol = {
+        v["symbol"]: {
+            "signal_score": (v.get("signal") or {}).get("score"),
+            "signal": v.get("signal_line"),
+        }
+        for v in verdicts
+        if v.get("signal")
+    }
+    return (
+        [a.model_copy(update=by_symbol.get(a.symbol, {})) for a in actions],
+        [h.model_copy(update=by_symbol.get(h.symbol, {})) for h in holds],
+    )
+
+
+def _with_prices(
+    actions: list[ActionOut], meta: dict[str, tuple[str | None, str | None]]
+) -> list[ActionOut]:
+    """Stamp each order with its price's source and time.
+
+    A buy is priced off the live quote. A sell is priced off the position's
+    value, which the plan refreshed from today's market data when it started —
+    it is kept that way so a sell can never be sized for more shares than are
+    held (see ``_sell_action``).
+    """
+    now = datetime.now(UTC).isoformat()
+    out = []
+    for a in actions:
+        if a.side == "buy" and a.symbol in meta:
+            source, as_of = meta[a.symbol]
+        else:
+            source, as_of = "position value", now
+        out.append(a.model_copy(update={"price_source": source, "price_as_of": as_of}))
+    return out
+
+
+def _signal_terms(result: dict) -> dict:
+    """The signal's score and volatility from an anchored verdict, if any."""
+    sig = result.get("signal")
+    if not isinstance(sig, dict):
+        return {}
+    return {"score": sig.get("score"), "vol": sig.get("vol")}
+
+
+def trim_fraction(result: dict, confidence: float) -> float:
+    """How much of a holding a TRIM sells.
+
+    With the signal: a full exit when the trailing stop is hit or the trend is
+    deeply negative; half when the signal itself calls a trim; a third when
+    only the committee does. Without it, the committee's confidence decides.
+    """
+    sig = result.get("signal")
+    if not isinstance(sig, dict):
+        return 1.0 if confidence >= FULL_EXIT_CONFIDENCE else PARTIAL_TRIM_FRACTION
+    if result.get("signal_action") != "TRIM":
+        return OVERLAY_TRIM_FRACTION
+    symbol = str(result.get("symbol") or "")
+    if not is_broad_fund(symbol) and (
+        sig.get("stop_hit") or float(sig.get("score") or 0) <= EXIT_SCORE
+    ):
+        return 1.0
+    return PARTIAL_TRIM_FRACTION
+
+
 @dataclass
 class _Sized:
     """What stage 3 produced. A dataclass rather than a tuple because the
@@ -149,6 +299,9 @@ class _Stage:
     options: dict
     #: Turns the committee's results into what the stage returns.
     finish: Callable[[list[dict]], tuple]
+    #: Today's verdicts already on file, by symbol — not asked again.
+    cached: dict[str, dict] = field(default_factory=dict)
+    held: bool = False
 
     @classmethod
     def done(cls, value: tuple) -> _Stage:
@@ -163,12 +316,19 @@ class PortfolioActionsService:
         provider: MarketDataProvider,
         llm: LLMProvider,
         context: MarketContextService | None = None,
+        *,
+        broker: SnapTradeGateway | None = None,
+        cipher: TokenCipher | None = None,
     ) -> None:
         self.session = session
         self.provider = provider
         self.llm = llm
         # Optional keyword so every existing construction keeps working.
         self.context = context
+        # With both set, prices come from the user's own brokerage in real
+        # time where it can quote them (see live_quotes).
+        self.broker = broker
+        self.cipher = cipher
         self.market_data = MarketDataService(session, provider)
         self.holdings = HoldingRepository(session)
         self.proposals = ProposedOrderRepository(session)
@@ -187,11 +347,28 @@ class PortfolioActionsService:
                 "what to buy or sell."
             )
 
+        # The trading day this plan is for. Signals are computed from sessions
+        # completed before it and committee verdicts are pinned to it, so the
+        # same question asked twice today gets the same answer.
+        self._period = market_period()
+        self._user_id = user_id
+        self._quote_meta: dict[str, tuple[str | None, str | None]] = {}
+
         # Price the book before valuing it: a position synced from the broker
         # minutes ago has no cached bars yet, and an unpriced holding would drop
         # out of the portfolio silently — taking any decision about it with it.
-        await self.market_data.sync_bars([h.symbol for h in rows])
+        # refresh_today: value the book at today's price as of now, not at
+        # whatever the first sync of the day saw. The signals ignore today's
+        # bar either way (completed sessions only), so this moves the money
+        # figures without moving the verdicts.
+        await self.market_data.sync_bars([h.symbol for h in rows], refresh_today=True)
         await self.session.commit()
+
+        # Real-time quotes from the user's brokerage when they have one linked;
+        # market data otherwise. Resolved once, used by every quote below.
+        self.deploy.live_quotes = await broker_quote_fetcher(
+            self.session, user_id, self.broker, self.cipher
+        )
 
         portfolio = await self.invest.portfolio(user_id)
         if not portfolio.connected or not portfolio.positions:
@@ -250,9 +427,13 @@ class PortfolioActionsService:
         cand_stage = await self._judge_candidates(
             user_id, body, passed, use_ai, macro, researched, brief
         )
-        (held_results, held_prices, held_names), (candidates, considered) = await asyncio.gather(
+        (held_out, held_fresh), (cand_out, cand_fresh) = await asyncio.gather(
             self._run_stage(held_stage, use_ai), self._run_stage(cand_stage, use_ai)
         )
+        held_results, held_prices, held_names = held_out
+        candidates, considered = cand_out
+        await self._remember(held_fresh, held=True)
+        await self._remember(cand_fresh, held=False)
         # Each verdict degrades on its own, so "the AI ran" is not a property of
         # the request — it is a count of which ones actually came back. Saying
         # "ai" over a plan that is mostly rules would overstate it.
@@ -292,7 +473,10 @@ class PortfolioActionsService:
             model=model,
             limits=limits,
         )
-        actions, holds = sized.actions, sized.holds
+        actions, holds = _with_signals(
+            sized.actions, sized.holds, [*held_results.values(), *candidates]
+        )
+        actions = _with_prices(actions, self._quote_meta)
         cash_after, unfunded = sized.cash_after, sized.unfunded
 
         return ActionPlanOut(
@@ -309,6 +493,7 @@ class PortfolioActionsService:
             ai_note=ai_note,
             note=self._note(actions, holds, cash_after, body, unfunded, sized.factors),
             factors=sized.factors,
+            period=self._period.isoformat(),
             research=research_out(
                 MarketContext(as_of=date.today(), macro=macro, symbols=researched)
                 if (macro is not None or researched)
@@ -393,11 +578,12 @@ class PortfolioActionsService:
                 )
             symbols = symbols[: settings.max_held_judged]
 
-        # Bars were synced by `plan` before the portfolio was valued.
+        # Bars were synced by `plan` before the portfolio was valued. Only
+        # completed sessions feed the signal: today's bar moves all day.
         series = await self.market_data.get_close_series(symbols)
         scored: list[tuple[float, str, Indicators, str]] = []
         for symbol in symbols:
-            closes = [c for _, c in series.get(symbol, [])]
+            closes = completed_closes(series.get(symbol, []), self._period)
             try:
                 ind = compute_indicators(closes)
             except ValueError:
@@ -412,6 +598,7 @@ class PortfolioActionsService:
             scored.append((0.0, symbol, ind, "hold"))
 
         quoted, unpriced = await self.deploy._quote(scored)
+        self._remember_quotes(quoted)
         passed.extend(unpriced)
         if not quoted:
             return _Stage.done(({}, {}, {}))
@@ -445,20 +632,28 @@ class PortfolioActionsService:
                 stale_symbols=tuple(stale),
             )
 
+        inds = {sym: ind for sym, _, ind, _ in quoted}
         return _Stage(
             items=[(sym, quote, ind) for sym, quote, ind, _ in quoted],
             options={
                 "held": contexts,
-                "rules": {sym: rules_verdict(ind, held=True) for sym, _, ind, _ in quoted},
+                "rules": {
+                    sym: rules_verdict(ind, held=True, symbol=sym) for sym, _, ind, _ in quoted
+                },
                 "market": market,
                 "portfolio": brief,
                 "second_opinion": settings.llm_second_opinion_on_sells,
             },
             finish=lambda results: (
-                {r["symbol"]: r for r in results},
+                {
+                    r["symbol"]: anchor_to_signal(r, inds.get(r["symbol"]), held=True)
+                    for r in results
+                },
                 {sym: price for sym, _, _, price in quoted},
                 {sym: quote.get("name") for sym, quote, _, _ in quoted},
             ),
+            cached=await self._cached(list(inds), held=True, use_ai=use_ai),
+            held=True,
         )
 
     # --- stage 2: what you could own instead ---
@@ -483,12 +678,13 @@ class PortfolioActionsService:
         await self.market_data.sync_bars(pool)
         await self.session.commit()
 
-        ranked, unpriced = await self.deploy._rank(pool)
+        ranked, unpriced = await self.deploy._rank(pool, before=self._period)
         passed.extend(unpriced)
         if not ranked:
             return _Stage.done(([], len(pool)))
 
         quoted, no_quote = await self.deploy._quote(ranked[: body.max_candidates])
+        self._remember_quotes(quoted)
         passed.extend(no_quote)
         if not quoted:
             return _Stage.done(([], len(pool)))
@@ -512,35 +708,84 @@ class PortfolioActionsService:
 
         prices = {sym: price for sym, _, _, price in quoted}
         names = {sym: quote.get("name") for sym, quote, _, _ in quoted}
+        inds = {sym: ind for sym, _, ind, _ in quoted}
         return _Stage(
             items=[(sym, quote, ind) for sym, quote, ind, _ in quoted],
             options={
-                "rules": {sym: rules_verdict(ind, held=False) for sym, _, ind, _ in quoted},
+                "rules": {
+                    sym: rules_verdict(ind, held=False, symbol=sym) for sym, _, ind, _ in quoted
+                },
                 "market": market,
                 "portfolio": brief,
             },
             finish=lambda results: (
                 [
-                    {**r, "price_cad": prices[r["symbol"]], "name": names.get(r["symbol"])}
+                    {
+                        **anchor_to_signal(r, inds.get(r["symbol"]), held=False),
+                        "price_cad": prices[r["symbol"]],
+                        "name": names.get(r["symbol"]),
+                    }
                     for r in results
                 ],
                 len(pool),
             ),
+            cached=await self._cached(list(inds), held=False, use_ai=use_ai),
         )
 
-    async def _run_stage(self, stage: _Stage, use_ai: bool):
-        """The committee call a stage prepared, on its own deadline."""
+    async def _run_stage(self, stage: _Stage, use_ai: bool) -> tuple[tuple, list[dict]]:
+        """The committee call a stage prepared, on its own deadline.
+
+        Returns what the stage produces plus the verdicts that were freshly
+        asked for (to be remembered for the rest of the day). Symbols with a
+        verdict already on file for today are not asked again.
+        """
         if not stage.items:
-            return stage.finish([])
-        with llm_budget(
-            wait=settings.llm_wait_actions_seconds,
-            max_pass_sleep=settings.llm_max_pass_sleep_seconds,
-            max_output_tokens=settings.llm_committee_max_tokens,
-        ):
-            results = await run_committee_many(
-                stage.items, self.llm, use_ai=use_ai, **stage.options
+            return stage.finish([]), []
+        todo = [item for item in stage.items if item[0] not in stage.cached]
+        fresh: list[dict] = []
+        if todo:
+            with llm_budget(
+                wait=settings.llm_wait_actions_seconds,
+                max_pass_sleep=settings.llm_max_pass_sleep_seconds,
+                max_output_tokens=settings.llm_committee_max_tokens,
+            ):
+                fresh = await run_committee_many(todo, self.llm, use_ai=use_ai, **stage.options)
+        by_symbol = {**stage.cached, **{r["symbol"]: r for r in fresh}}
+        results = [by_symbol[sym] for sym, _, _ in stage.items if sym in by_symbol]
+        return stage.finish(results), fresh
+
+    def _remember_quotes(self, quoted: list[tuple[str, dict, Indicators, float]]) -> None:
+        """Where each price came from and when, for the plan's lines."""
+        for sym, quote, _, _ in quoted:
+            self._quote_meta[sym] = (quote.get("source"), quote.get("as_of"))
+
+    # --- the day's verdicts ---
+    async def _cached(self, symbols: list[str], *, held: bool, use_ai: bool) -> dict[str, dict]:
+        """Committee verdicts already reached today for these symbols."""
+        if not use_ai or not symbols:
+            return {}
+        try:
+            return await VerdictCacheRepository(self.session).get_many(
+                self._user_id, symbols, held=held, period=self._period
             )
-        return stage.finish(results)
+        except Exception as exc:  # noqa: BLE001 — a cache miss is never fatal
+            logger.warning("Verdict cache read failed: %s", exc)
+            return {}
+
+    async def _remember(self, fresh: list[dict], *, held: bool) -> None:
+        """Pin today's AI verdicts. Rules fallbacks are not stored: the next
+        run should try the model again rather than inherit an outage."""
+        ai = [r for r in fresh if r.get("source") == "ai"]
+        if not ai:
+            return
+        try:
+            await VerdictCacheRepository(self.session).put_many(
+                self._user_id, ai, held=held, period=self._period
+            )
+            await self.session.commit()
+        except Exception as exc:  # noqa: BLE001 — failing to cache is not failing to plan
+            logger.warning("Verdict cache write failed: %s", exc)
+            await self.session.rollback()
 
     # --- stage 3: verdicts -> orders against one budget ---
     def _size(
@@ -595,7 +840,7 @@ class PortfolioActionsService:
             value = position["market_value"]
 
             if action == "TRIM":
-                fraction = 1.0 if confidence >= FULL_EXIT_CONFIDENCE else PARTIAL_TRIM_FRACTION
+                fraction = trim_fraction(result, confidence)
                 sell_value = min(value * fraction, value)
                 if sell_value >= MIN_TRADE_CAD:
                     sell = self._sell_action(
@@ -640,6 +885,7 @@ class PortfolioActionsService:
                         "current_value": value,
                         "label": "ADD",
                         "verdict_source": str(result.get("source") or "rules"),
+                        **_signal_terms(result),
                     }
                 )
                 continue
@@ -660,6 +906,7 @@ class PortfolioActionsService:
                     "current_value": 0.0,
                     "label": "NEW",
                     "verdict_source": str(c.get("source") or "rules"),
+                    **_signal_terms(c),
                 }
             )
 
@@ -688,9 +935,17 @@ class PortfolioActionsService:
         # have somewhere else to go. Selling a position down to sit in cash is
         # not diversification, and a single broad ETF at 100% is a deliberate
         # strategy rather than a mistake to correct.
+        #
+        # The ceiling is risk-based: a fixed share of the account's volatility
+        # per name (see quant_signals.vol_capped_weight), never above the flat
+        # cap. It only fires once the position has drifted a band past it, so
+        # ordinary drift doesn't turn into a trade every time you ask.
         for symbol, position, result, price in keep:
             weight = position["weight"]
-            excess = max(0.0, (weight - CONCENTRATION_CAP) * equity)
+            vol = _signal_terms(result).get("vol")
+            ceiling = vol_capped_weight(vol, CONCENTRATION_CAP, symbol)
+            over = weight > CONCENTRATION_CAP or weight > ceiling * REBALANCE_BAND
+            excess = max(0.0, (weight - ceiling) * equity) if over else 0.0
             elsewhere = [a for a in adds if a["symbol"] != symbol]
             if excess < MIN_TRADE_CAD or not elsewhere:
                 holds.append(
@@ -717,6 +972,11 @@ class PortfolioActionsService:
                     f"{symbol} is {weight:.0%} of the account, above the "
                     f"{CONCENTRATION_CAP:.0%} single-position limit — trimming back "
                     "to it and redeploying."
+                    if ceiling >= CONCENTRATION_CAP
+                    else f"{symbol} is {weight:.0%} of the account; at its volatility "
+                    f"({(vol or 0):.0%} a year) one name should be about {ceiling:.0%} so "
+                    "no single stock dominates the risk — trimming back to that and "
+                    "redeploying."
                 ),
                 sizing=body.sizing,
             )
@@ -1114,7 +1374,17 @@ class PortfolioActionsService:
         floor = max(MIN_TRADE_CAD, equity * MEANINGFUL_TRADE_PCT)
         adds = adds[: max(1, int(spendable // floor))]
 
-        weights = {a["symbol"]: max(a["confidence"], 0.01) for a in adds}
+        # Sized by expected edge per unit of risk (score / volatility, see
+        # quant_signals.alpha_weight) when the signal is known, by conviction
+        # otherwise.
+        weights = {
+            a["symbol"]: (
+                alpha_weight(a["score"], a.get("vol"))
+                if a.get("score") is not None
+                else max(a["confidence"], 0.01)
+            )
+            for a in adds
+        }
         total = sum(weights.values())
         purchases: list[ActionOut] = []
         unaffordable: list[dict] = []
@@ -1123,8 +1393,10 @@ class PortfolioActionsService:
         for a in adds:
             symbol = a["symbol"]
             allocation = spendable * (weights[symbol] / total)
-            # Room left before this name breaches the concentration cap.
-            room = max(0.0, CONCENTRATION_CAP * equity - a["current_value"])
+            # Room left before this name breaches its cap: the flat
+            # concentration limit, tightened for a volatile single name.
+            cap = vol_capped_weight(a.get("vol"), CONCENTRATION_CAP, symbol)
+            room = max(0.0, cap * equity - a["current_value"])
             # Rounded to cents HERE rather than just before the order is built,
             # so the figure compared against `headroom` is the same one that
             # later decrements it. Rounding afterwards let a fraction of a cent

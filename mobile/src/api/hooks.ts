@@ -4,6 +4,7 @@ import { useSession } from "../stores/session";
 import { api } from "./client";
 import {
   Account,
+  ActionRun,
   Advice,
   BacktestRequest,
   BacktestResponse,
@@ -43,7 +44,6 @@ import {
   ProjectionRequest,
   ProjectionResponse,
   ActionAcceptRequest,
-  ActionPlan,
   ActionPlanRequest,
   Proposal,
   Sizing,
@@ -539,21 +539,43 @@ export function useAcceptDeployPlan() {
 
 // --- AI portfolio actions ---
 /**
- * One committee deliberation per held position *and* per shortlisted
- * candidate, so this is the slowest call the app makes — a portfolio of five
- * with a shortlist of five is ten round trips to the model.
+ * The most recent "What should I do?" plan, built or still building.
  *
- * Measured at ~95s warm against the free tier, which ran straight past the old
- * two-minute ceiling and surfaced as "could not build a plan" on a request that
- * was actually still working. The server has no deadline of its own here, so
- * this is the only limit that matters — set it above the slow case, not the
- * typical one.
+ * The plan runs on the server as a background job, so this is the source of
+ * truth for the screen — not a request the screen holds open. Leave the
+ * screen, switch tabs or switch apps: when you come back this picks the run
+ * up where it is. Polls every few seconds only while a run is in progress.
  */
-export function useActionPlan() {
+export function useLatestActionRun() {
+  return useQuery({
+    queryKey: ["invest", "actions", "latest"],
+    queryFn: async () =>
+      (await api.get<ActionRun | null>("/invest/actions/runs/latest")).data ?? null,
+    staleTime: 0,
+    refetchInterval: (query) =>
+      (query.state.data as ActionRun | null | undefined)?.status === "running" ? 3_000 : false,
+  });
+}
+
+/**
+ * Start a plan. Returns at once with the run (or the day's existing plan for
+ * the same inputs, `reused`). On a serverless host the server may hold this
+ * request open until the run is done — the screen does not wait on it: it
+ * polls `useLatestActionRun` either way.
+ */
+export function useStartActionRun() {
+  const qc = useQueryClient();
+  const key = ["invest", "actions", "latest"];
   return useMutation({
-    mutationFn: async (body: ActionPlanRequest) =>
-      (await api.post<ActionPlan>("/invest/actions/propose", body, { timeout: 300_000 }))
-        .data,
+    mutationFn: async (body: ActionPlanRequest & { force?: boolean }) =>
+      (await api.post<ActionRun>("/invest/actions/runs", body, { timeout: 300_000 })).data,
+    onMutate: () => {
+      // Start polling straight away — the POST may not return until the plan
+      // is finished, and the screen should show progress before then.
+      setTimeout(() => qc.invalidateQueries({ queryKey: key }), 1_500);
+    },
+    onSuccess: (run) => qc.setQueryData(key, run),
+    onSettled: () => qc.invalidateQueries({ queryKey: key }),
   });
 }
 

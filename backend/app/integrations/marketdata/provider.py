@@ -29,6 +29,11 @@ class SymbolQuote:
     price: float
     currency: str  # "USD" | "CAD"
     name: str | None = None
+    # When the price was struck (exchange time, UTC), and who supplied it.
+    # Shown next to every number a plan acts on, so "how fresh is this?"
+    # always has an answer.
+    as_of: datetime | None = None
+    source: str = "yahoo"
 
 
 # --- candlesticks ---

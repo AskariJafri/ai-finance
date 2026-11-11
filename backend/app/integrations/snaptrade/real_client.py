@@ -16,6 +16,7 @@ from typing import Any
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.integrations.snaptrade.gateway import (
+    MAX_QUOTES_PER_CALL,
     BrokerOrderState,
     OrderAction,
     OrderType,
@@ -24,6 +25,7 @@ from app.integrations.snaptrade.gateway import (
     SnapTradeGateway,
     SnapTradeOrderResult,
     SnapTradePosition,
+    SnapTradeQuote,
     SnapTradeRegistration,
     SnapTradeSymbol,
 )
@@ -423,6 +425,40 @@ class RealSnapTradeClient(SnapTradeGateway):
                         description=_get(raw, "description"),
                     )
         return None
+
+    async def get_quotes(
+        self,
+        *,
+        snaptrade_user_id: str,
+        user_secret: str,
+        account_id: str,
+        tickers: list[str],
+    ) -> list[SnapTradeQuote]:
+        if not tickers:
+            return []
+        uid, usecret = self._auth(snaptrade_user_id, user_secret)
+        try:
+            response = await asyncio.to_thread(
+                self._client.trading.get_user_account_quotes,
+                user_id=uid,
+                user_secret=usecret,
+                account_id=account_id,
+                symbols=",".join(t.upper() for t in tickers[:MAX_QUOTES_PER_CALL]),
+                use_ticker=True,
+            )
+        except Exception as exc:
+            raise SnapTradeError(f"Quote lookup failed: {exc}") from exc
+
+        quotes: list[SnapTradeQuote] = []
+        for raw in _results(response):
+            ticker = _normalize_ticker(_get(raw, "symbol", default={}))
+            last = _to_float(_get(raw, "last_trade_price"))
+            bid = _to_float(_get(raw, "bid_price")) or None
+            ask = _to_float(_get(raw, "ask_price")) or None
+            price = last or ((bid + ask) / 2 if bid and ask else 0.0)
+            if ticker and price > 0:
+                quotes.append(SnapTradeQuote(symbol=ticker, price=price, bid=bid, ask=ask))
+        return quotes
 
     async def place_order(
         self,

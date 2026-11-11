@@ -380,6 +380,60 @@ class AnalysisSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     payload: Mapped[dict] = mapped_column(JSON)
 
 
+class CommitteeVerdictCache(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One committee verdict per user, symbol, question and trading day.
+
+    Asking the same model the same question twice does not get the same answer
+    — sampling, a different fallback model, a headline that landed in between.
+    A plan that flips on every tap is worse than useless, so within a trading
+    day the first AI verdict on a ticker is the verdict. Only AI answers are
+    stored: a rules fallback should be retried, not frozen in.
+    """
+
+    __tablename__ = "committee_verdict_cache"
+    __table_args__ = (
+        UniqueConstraint("user_id", "symbol", "held", "period", name="uq_verdict_cache_key"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(16))
+    held: Mapped[bool] = mapped_column(Boolean)
+    period: Mapped[date_type] = mapped_column(Date, index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+
+
+class ActionPlanRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A "What should I do?" plan, built in the background.
+
+    The plan takes one to three minutes. Run as a single HTTP request it was
+    tied to the screen that made it: leave the screen, switch tabs or put the
+    phone down and the request (and the answer) was lost. As a row, the work
+    survives the client going away, and whichever screen opens next can show
+    it.
+
+    ``input_key`` fingerprints the request and the holdings it was built from,
+    so asking again in the same trading period with nothing changed returns the
+    plan already made instead of a new, slightly different one.
+    """
+
+    __tablename__ = "action_plan_runs"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(12), default="running")  # running|done|failed
+    period: Mapped[date_type] = mapped_column(Date)
+    input_key: Mapped[str] = mapped_column(String(64), index=True)
+    request: Mapped[dict] = mapped_column(JSON)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    finished_at: Mapped[datetime_type | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class PaperAccount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Cash balance for the paper-trading sandbox (CAD). Seeded on first use."""
 

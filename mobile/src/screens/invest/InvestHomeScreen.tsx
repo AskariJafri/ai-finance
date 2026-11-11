@@ -13,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import {
   useBrokerageConnections,
   useInvestSync,
+  useLatestActionRun,
   usePortfolio,
   useSyncBrokerage,
 } from "../../api/hooks";
@@ -90,6 +91,23 @@ export function InvestHomeScreen() {
   const connections = useBrokerageConnections();
   const syncBrokerage = useSyncBrokerage();
   const linked = connections.data ?? [];
+  // The plan builds in the background; say so here, so it is clear the work
+  // carried on after leaving that screen.
+  const planRun = useLatestActionRun().data;
+  const primary = PRIMARY.map((item) =>
+    item.screen !== "Actions" || !planRun
+      ? item
+      : planRun.status === "running"
+        ? { ...item, subtitle: "Building your plan… tap to watch" }
+        : planRun.status === "done" && planRun.result
+          ? {
+              ...item,
+              subtitle: planRun.result.actions.length
+                ? `Plan ready: ${planRun.result.actions.length} trade${planRun.result.actions.length === 1 ? "" : "s"} suggested`
+                : "Plan ready: no changes suggested",
+            }
+          : item,
+  );
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }} edges={["top"]}>
@@ -167,7 +185,7 @@ export function InvestHomeScreen() {
             </Card>
           )}
 
-          <PrimaryActions items={PRIMARY} onNavigate={(s) => navigation.navigate(s)} />
+          <PrimaryActions items={primary} onNavigate={(s) => navigation.navigate(s)} />
           <ToolGrid
             title="Research"
             items={TOOLS_EMPTY}
@@ -282,7 +300,7 @@ export function InvestHomeScreen() {
             ))}
           </Card>
 
-          <PrimaryActions items={PRIMARY} onNavigate={(s) => navigation.navigate(s)} />
+          <PrimaryActions items={primary} onNavigate={(s) => navigation.navigate(s)} />
           <ToolGrid title="Tools" items={TOOLS} onNavigate={(s) => navigation.navigate(s)} />
           <PracticeRow onNavigate={(s) => navigation.navigate(s)} />
 

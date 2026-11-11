@@ -459,7 +459,7 @@ class RulesVerdict:
     reason: str
 
     def line(self) -> str:
-        return f"{self.action} (score {self.score:+.1f}): {self.reason}"
+        return f"{self.action} (score {self.score:+.2f}): {self.reason}"
 
 
 @dataclass(frozen=True)

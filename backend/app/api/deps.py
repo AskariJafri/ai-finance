@@ -135,6 +135,8 @@ def get_portfolio_actions_service(session: SessionDep) -> PortfolioActionsServic
         get_market_data_provider(),
         get_advice_llm_provider(),
         get_market_context_service(session),
+        broker=get_snaptrade_gateway(),
+        cipher=get_cipher(),
     )
 
 

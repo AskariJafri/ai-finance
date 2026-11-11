@@ -177,4 +177,10 @@ class YahooMarketData:
             price=float(price),
             currency=(meta.get("currency") or "USD").upper(),
             name=meta.get("longName") or meta.get("shortName"),
+            as_of=(
+                datetime.fromtimestamp(int(meta["regularMarketTime"]), tz=UTC)
+                if meta.get("regularMarketTime")
+                else datetime.now(UTC)
+            ),
+            source="yahoo",
         )

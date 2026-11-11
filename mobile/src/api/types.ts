@@ -637,6 +637,14 @@ export type PortfolioAction = {
   projected_weight: number;
   confidence: number;
   reason: string;
+  /** Composite trend/momentum score, -1..+1, the verdict was anchored to. */
+  signal_score?: number | null;
+  /** One-line breakdown of that score. */
+  signal?: string | null;
+  /** "broker:<institution>" (real time), "yahoo", or "position value". */
+  price_source?: string | null;
+  /** When the price was struck, ISO 8601. */
+  price_as_of?: string | null;
 };
 
 /** Something held that the plan deliberately leaves alone. */
@@ -645,6 +653,8 @@ export type ActionHold = {
   weight: number;
   confidence: number;
   reason: string;
+  signal_score?: number | null;
+  signal?: string | null;
 };
 
 /** One factor, where the book sits now and where the plan would leave it. */
@@ -707,7 +717,26 @@ export type ActionPlan = {
   ai_note?: string | null;
   note: string;
   factors: FactorPlan | null;
+  /** Trading day the signals were computed for. */
+  period?: string | null;
   disclaimer: string;
+};
+
+/**
+ * A plan built in the background. The app starts one and polls for it, so
+ * leaving the screen (or the app) never loses the answer.
+ */
+export type ActionRun = {
+  id: string;
+  status: "running" | "done" | "failed";
+  period: string;
+  request: ActionPlanRequest;
+  result: ActionPlan | null;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+  /** An earlier plan for the same inputs and day, returned instead of a new one. */
+  reused: boolean;
 };
 
 export type ActionAcceptRequest = {

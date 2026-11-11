@@ -25,6 +25,7 @@ from app.integrations.snaptrade.gateway import (
     SnapTradeGateway,
     SnapTradeOrderResult,
     SnapTradePosition,
+    SnapTradeQuote,
     SnapTradeRegistration,
     SnapTradeSymbol,
 )
@@ -133,6 +134,26 @@ class MockSnapTradeClient(SnapTradeGateway):
             ticker=key,
             description=f"Mock instrument {key}",
         )
+
+    async def get_quotes(
+        self,
+        *,
+        snaptrade_user_id: str,
+        user_secret: str,
+        account_id: str,
+        tickers: list[str],
+    ) -> list[SnapTradeQuote]:
+        out = []
+        for ticker in tickers[:10]:
+            cents = _PRICES_CENTS.get(ticker.upper())
+            if cents:
+                price = cents / 100
+                out.append(
+                    SnapTradeQuote(
+                        symbol=ticker.upper(), price=price, bid=price - 0.01, ask=price + 0.01
+                    )
+                )
+        return out
 
     async def place_order(
         self,

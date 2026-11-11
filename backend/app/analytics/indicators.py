@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from app.analytics.quant_signals import QuantSignal, compute_signal
+
 
 @dataclass(frozen=True)
 class Indicators:
@@ -22,6 +24,9 @@ class Indicators:
     max_drawdown: float | None
     vol_annual: float | None
     trend: str  # "up" | "down" | "flat"
+    # The composite house signal (see quant_signals). None below ~3 months of
+    # history, in which case the rules fall back to the short-window reading.
+    signal: QuantSignal | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -102,4 +107,5 @@ def compute_indicators(closes: list[float]) -> Indicators:
         max_drawdown=_max_drawdown(closes),
         vol_annual=_vol_annual(closes),
         trend=trend,
+        signal=compute_signal(closes),
     )

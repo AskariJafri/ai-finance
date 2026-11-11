@@ -120,6 +120,7 @@ def _figures(symbol: str, quote: dict, ind: Indicators) -> str:
         f"RSI14={ind.rsi14}. "
         f"Returns 1m/3m/6m={_pct(ind.ret_1m)}/{_pct(ind.ret_3m)}/{_pct(ind.ret_6m)}. "
         f"Max drawdown={_pct(ind.max_drawdown)}. Annualized vol={_pct(ind.vol_annual)}."
+        + (f" Long-horizon signal: {ind.signal.line()}." if ind.signal is not None else "")
     )
 
 
@@ -370,7 +371,9 @@ async def run_committee(
         raw = await llm.complete(
             prompt,
             system=HELD_SYSTEM if held is not None else COMMITTEE_SYSTEM,
-            temperature=0.3,
+            # Zero, not 0.3. The same question on the same day must get the
+            # same answer; sampling noise was half of why it did not.
+            temperature=0.0,
             json_object=True,
         )
         payload = _parse_json(raw)
@@ -411,6 +414,7 @@ async def run_committee(
 #: the model departing from the house signal.
 _AGREES = {
     "buy": {"BUY", "ADD"},
+    "add": {"ADD"},
     "sell": {"SKIP", "TRIM"},
     "hold": {"HOLD"},
     "skip": {"SKIP", "HOLD"},
@@ -636,7 +640,18 @@ def rules_only(symbol: str, quote: dict, ind: Indicators, *, held: bool = False)
 
 def _rules_verdict(ind: Indicators, bullish: int, bearish: int, *, held: bool = False) -> dict:
     """Transparent fallback when the LLM is unavailable — an honest read of the
-    indicators, never a fabricated one."""
+    indicators, never a fabricated one.
+
+    With enough history this is the house signal itself, so an offline answer
+    is the same answer the planner anchors on rather than a third opinion."""
+    if ind.signal is not None:
+        action = ind.signal.decide(held=held)
+        return {
+            "action": action,
+            "confidence": ind.signal.confidence(action),
+            "summary": f"Rules-based read ({ind.signal.line()}); AI offline.",
+            "source": "rules",
+        }
     reasons: list[str] = []
     score = 0
     if ind.trend == "up":

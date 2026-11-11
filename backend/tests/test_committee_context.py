@@ -131,7 +131,7 @@ def test_the_rules_reason_reaches_the_model_verbatim():
     """
     out = _context("ACME", QUOTE, IND, rules=RULES)
     assert "uptrend, RSI 55, 3m +5%" in out
-    assert "buy (score +2.5)" in out
+    assert "buy (score +2.50)" in out
 
 
 def test_a_no_coverage_symbol_says_absence_is_not_good_news():

@@ -14,6 +14,7 @@ from app.services.portfolio_actions_service import PortfolioActionsService
 from tests.test_portfolio_actions import (  # reuse the established harness
     FakeProvider,
     ScriptedLLM,
+    SignalProvider,
     _cash,
     _hold,
     _user,
@@ -93,7 +94,9 @@ async def test_cash_still_buys_when_the_candidate_stage_runs_out_of_llm(seeded_s
     await _hold(seeded_session, user_id, "ZAG.TO", 10, 5_000)
     await _cash(seeded_session, user_id, 5_000)
 
-    svc = PortfolioActionsService(seeded_session, FakeProvider(), QuotaRunsOut({}))
+    svc = PortfolioActionsService(
+        seeded_session, SignalProvider(declining={"XEQT.TO"}), QuotaRunsOut({})
+    )
     plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=3))
     sells, buys = _sides(plan)
     print("\n[3] sells=", sells, "\n    buys=", buys, "\n    cash_after=", plan.cash_after)
@@ -121,7 +124,7 @@ async def test_rules_only_mode_can_still_buy(seeded_session):
     await _hold(seeded_session, user_id, "XEQT.TO", 10, 5_000)
     await _cash(seeded_session, user_id, 5_000)
 
-    svc = PortfolioActionsService(seeded_session, FakeProvider(), Offline())
+    svc = PortfolioActionsService(seeded_session, SignalProvider(), Offline())
     plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=3))
     sells, buys = _sides(plan)
     print("\n[4] source=", plan.source, "sells=", sells, "\n    buys=", buys)
@@ -339,7 +342,9 @@ async def test_judged_sell_proceeds_are_reserved_but_cash_is_not(seeded_session)
 
     for cash, expect_buys in ((0.0, False), (4_000.0, True)):
         await _cash(seeded_session, user_id, cash)
-        svc = PortfolioActionsService(seeded_session, FakeProvider(), OnlyTheHolding({}))
+        svc = PortfolioActionsService(
+            seeded_session, SignalProvider(declining={"XEQT.TO"}), OnlyTheHolding({})
+        )
         plan = await svc.plan(user_id, ActionPlanIn(max_new_positions=3))
         sells, buys = _sides(plan)
         print(f"\n[11] cash={cash} sells=", sells, "\n     buys=", buys)

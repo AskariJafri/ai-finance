@@ -1,7 +1,8 @@
 import { useNavigation } from "@react-navigation/native";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -13,9 +14,10 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import {
   useAcceptActionPlan,
-  useActionPlan,
   useBrokerageConnections,
+  useLatestActionRun,
   usePortfolio,
+  useStartActionRun,
 } from "../../api/hooks";
 import type { FactorPlan, PortfolioAction, Sizing } from "../../api/types";
 import { Button } from "../../components/Button";
@@ -34,19 +36,57 @@ export function ActionsScreen() {
 
   const portfolio = usePortfolio();
   const connections = useBrokerageConnections();
-  const plan = useActionPlan();
+  const latest = useLatestActionRun();
+  const start = useStartActionRun();
   const accept = useAcceptActionPlan();
 
   const linked = (connections.data ?? []).length > 0;
   const effectiveSizing: Sizing = sizing ?? (linked ? "dollars" : "shares");
   const parsed = Number(added.replace(/[^0-9.]/g, "")) || 0;
-  const result = plan.data;
 
-  const run = () =>
-    plan.mutate({
+  // The plan lives on the server, not in this screen. Whatever the latest run
+  // is — still building, finished, failed — is what we show, so leaving and
+  // coming back (or switching apps) picks up exactly where it was.
+  const runState = latest.data ?? null;
+  const building = start.isPending || runState?.status === "running";
+  const result = !building && runState?.status === "done" ? runState.result : null;
+  const failed = !building && runState?.status === "failed" ? runState.error : null;
+
+  // Start the form from the last plan's inputs, once, so "Build" asks the
+  // same question again by default.
+  const seeded = useRef(false);
+  useEffect(() => {
+    const req = runState?.request;
+    if (seeded.current || !req) return;
+    seeded.current = true;
+    if (req.added_cash != null) setAdded(String(req.added_cash));
+    if (req.max_new_positions != null) setNewNames(Math.min(3, req.max_new_positions));
+    if (req.sizing) setSizing(req.sizing);
+  }, [runState?.request]);
+
+  // The start request can drop (app backgrounded, slow network) while the
+  // run it started carries on server-side. Once a run from that attempt shows
+  // up, the dropped request is not an error worth showing.
+  useEffect(() => {
+    if (!start.isError || !runState) return;
+    if (new Date(runState.created_at).getTime() >= start.submittedAt - 5_000) start.reset();
+  }, [runState?.id, runState?.status, start.isError]);
+
+  // Timers pause while the app is in the background; check in the moment it
+  // comes back rather than waiting for the next poll.
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") latest.refetch();
+    });
+    return () => sub.remove();
+  }, [latest]);
+
+  const run = (force = false) =>
+    start.mutate({
       added_cash: parsed,
       max_new_positions: newNames,
       sizing: effectiveSizing,
+      force,
     });
 
   const acceptPlan = () => {
@@ -148,43 +188,49 @@ export function ActionsScreen() {
 
           <Button
             title="Build my plan"
-            onPress={run}
-            disabled={plan.isPending}
-            loading={plan.isPending}
+            onPress={() => run(false)}
+            disabled={building}
+            loading={building}
             style={{ marginTop: 14 }}
           />
           <Text style={[styles.hint, { color: theme.colors.textMuted }]}>
-            One deliberation per holding and per candidate — usually 1–3 minutes,
-            slower when the free model is busy. Keep this screen open. Nothing is
-            placed; you approve each trade yourself.
+            Usually 1–3 minutes. It builds on the server, so feel free to leave
+            this screen or switch apps — the plan will be here when you come
+            back. Asking again today with the same inputs gives the same plan.
+            Nothing is placed; you approve each trade yourself.
           </Text>
-          {plan.error ? (
+          {start.error && !building ? (
             <Text style={{ color: theme.colors.danger, fontSize: 12, marginTop: 8 }}>
-              {/* A timeout is not a failure to plan — it is the plan taking
-                  longer than we waited. Saying "could not build a plan" sends
-                  the user hunting for a problem with their portfolio. */}
-              {(plan.error as any)?.code === "ECONNABORTED"
-                ? "Timed out waiting for the committee. The free model is slow when it's busy — try again, or set 'New positions it may open' to None to halve the work."
-                : ((plan.error as any)?.response?.data?.detail ??
-                  "Couldn't reach the server to build a plan.")}
+              {(start.error as any)?.response?.data?.detail ??
+                "Couldn't reach the server to start a plan."}
+            </Text>
+          ) : null}
+          {failed ? (
+            <Text style={{ color: theme.colors.danger, fontSize: 12, marginTop: 8 }}>
+              {failed}
             </Text>
           ) : null}
         </Card>
 
-        {plan.isPending ? (
+        {building ? (
           <Card>
             <ActivityIndicator color={theme.colors.primary} />
             <Text style={[styles.hint, { color: theme.colors.textMuted, textAlign: "center" }]}>
-              The committee is deliberating… this can take a few minutes.
+              The committee is deliberating… You can leave this screen; the plan
+              keeps building.
             </Text>
           </Card>
         ) : null}
 
-        {result ? (
+        {result && runState ? (
           <>
             <Card>
               <Text style={[styles.cardTitle, { color: theme.colors.text }]}>
                 {result.actions.length ? "The plan" : "No changes"}
+              </Text>
+              <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 4 }}>
+                {`Built ${new Date(runState.finished_at ?? runState.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} for the ${runState.period} session`}
+                {runState.reused ? " · same inputs as earlier today, so the same plan" : ""}
               </Text>
               <Text style={[styles.note, { color: theme.colors.textMuted }]}>{result.note}</Text>
               {result.source !== "ai" ? (
@@ -237,6 +283,7 @@ export function ActionsScreen() {
                         {formatPercent(h.weight)} of account
                       </Text>
                     </View>
+                    <SignalLine score={h.signal_score} line={h.signal} />
                     <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 4 }}>
                       {h.reason}
                     </Text>
@@ -262,6 +309,17 @@ export function ActionsScreen() {
                 </Text>
               </Card>
             ) : null}
+
+            <Pressable onPress={() => run(true)} style={{ paddingVertical: 6 }}>
+              <Text style={{ color: theme.colors.primary, fontSize: 13, fontWeight: "600" }}>
+                Rebuild from scratch
+              </Text>
+              <Text style={{ color: theme.colors.textMuted, fontSize: 11, marginTop: 2 }}>
+                Re-reads prices and news. The committee's verdicts are fixed for the
+                trading day, so a rebuild only changes if your holdings or the market
+                data did.
+              </Text>
+            </Pressable>
 
             <Text style={[styles.disclaimer, { color: theme.colors.textMuted }]}>
               {result.disclaimer}
@@ -415,12 +473,58 @@ function ActionRow({ action, sizing }: { action: PortfolioAction; sizing: Sizing
         {"  ·  conf "}
         {formatPercent(action.confidence)}
       </Text>
+      <PriceStamp source={action.price_source} asOf={action.price_as_of} />
+      <SignalLine score={action.signal_score} line={action.signal} />
       {action.reason ? (
         <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 4 }}>
           {action.reason}
         </Text>
       ) : null}
     </View>
+  );
+}
+
+/** Where an order's price came from and how fresh it is. */
+function PriceStamp({ source, asOf }: { source?: string | null; asOf?: string | null }) {
+  const theme = useTheme();
+  if (!source && !asOf) return null;
+  const when = asOf
+    ? new Date(asOf).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })
+    : null;
+  const broker = source?.startsWith("broker:");
+  const label = broker
+    ? `live from ${source!.slice("broker:".length)}`
+    : source === "yahoo"
+      ? "market data (TSX may lag ~15 min)"
+      : source === "position value"
+        ? "your position's current value"
+        : source ?? "";
+  return (
+    <Text style={{ color: broker ? theme.colors.positive : theme.colors.textMuted, fontSize: 11, marginTop: 3 }}>
+      {broker ? "● " : ""}Price {when ? `as of ${when}` : ""} · {label}
+    </Text>
+  );
+}
+
+/**
+ * The trend/momentum score a verdict was anchored to. Shown so a plan reads
+ * as "the numbers say X, the committee agreed / adjusted" rather than as an
+ * opinion from nowhere.
+ */
+function SignalLine({ score, line }: { score?: number | null; line?: string | null }) {
+  const theme = useTheme();
+  if (score == null || !line) return null;
+  const color =
+    score >= 0.25 ? theme.colors.positive : score <= -0.25 ? theme.colors.negative : theme.colors.text;
+  return (
+    <Text style={{ color: theme.colors.textMuted, fontSize: 12, marginTop: 4 }}>
+      <Text style={{ color, fontWeight: "700" }}>
+        Signal {score >= 0 ? "+" : ""}
+        {score.toFixed(2)}
+      </Text>
+      {"  "}
+      {line.replace(/^trend score [+-]?[0-9.]+,?\s*/, "")}
+    </Text>
   );
 }
 

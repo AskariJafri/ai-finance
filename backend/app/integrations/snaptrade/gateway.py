@@ -96,6 +96,24 @@ class SnapTradeOrderResult:
     updated_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class SnapTradeQuote:
+    """A quote from the user's own brokerage, under the broker's data licence.
+
+    ``price`` is the last trade, falling back to the bid/ask midpoint. Native
+    currency of the listing (a ``.TO`` ticker quotes in CAD).
+    """
+
+    symbol: str
+    price: float
+    bid: float | None = None
+    ask: float | None = None
+
+
+#: SnapTrade returns at most this many quotes per request.
+MAX_QUOTES_PER_CALL = 10
+
+
 class SnapTradeError(RuntimeError):
     """Any failure crossing the SnapTrade boundary.
 
@@ -146,6 +164,22 @@ class SnapTradeGateway(Protocol):
         ticker: str,
     ) -> SnapTradeSymbol | None:
         """Map an app ticker to this account's broker-side instrument id."""
+        ...
+
+    async def get_quotes(
+        self,
+        *,
+        snaptrade_user_id: str,
+        user_secret: str,
+        account_id: str,
+        tickers: list[str],
+    ) -> list[SnapTradeQuote]:
+        """Current quotes from the broker, at most ``MAX_QUOTES_PER_CALL``.
+
+        Not a market-data feed: SnapTrade warns that polling it can get keys
+        disabled, and it is off on free plans unless their support enables it.
+        Call it once per user action, never on a timer.
+        """
         ...
 
     async def place_order(

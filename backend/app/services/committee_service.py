@@ -77,7 +77,7 @@ class CommitteeService:
                     quote_d,
                     ind,
                     self.llm,
-                    rules=rules_verdict(ind, held=False),
+                    rules=rules_verdict(ind, held=False, symbol=sym),
                     market=market,
                 )
         else:

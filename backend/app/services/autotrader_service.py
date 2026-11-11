@@ -45,13 +45,25 @@ DEFAULT_UNIVERSE = ["SPY", "AAPL", "MSFT", "NVDA", "VFV.TO"]
 MIN_PROPOSAL_CAD = 20.0
 
 
-def signal_for(ind: Indicators, held: bool) -> tuple[float, str, str]:
+def signal_for(ind: Indicators, held: bool, symbol: str | None = None) -> tuple[float, str, str]:
     """Return (score, action, reason). action ∈ buy|sell|hold|skip.
 
     Module-level and pure so the cash-deploy planner can rank a candidate pool
     with the same pre-committed rules the auto-trader trades on — no LLM calls,
     so it costs nothing to run over the whole universe.
+
+    The score is the composite momentum/trend signal in ``quant_signals``
+    whenever there is enough history for it (about three months); the short
+    SMA20/50 + RSI reading below is only the fallback for a new listing.
     """
+    q = ind.signal
+    if q is not None:
+        decision = q.decide(held=held, symbol=symbol)
+        action = {"BUY": "buy", "SKIP": "skip", "TRIM": "sell", "ADD": "hold", "HOLD": "hold"}[
+            decision
+        ]
+        return q.score, action, q.line()
+
     score = 0.0
     if ind.trend == "up":
         score += 1
@@ -72,14 +84,19 @@ def signal_for(ind: Indicators, held: bool) -> tuple[float, str, str]:
     return score, ("hold" if held else "skip"), f"no edge (trend {ind.trend}, RSI {ind.rsi14})"
 
 
-def rules_verdict(ind: Indicators, *, held: bool) -> RulesVerdict:
+def rules_verdict(ind: Indicators, *, held: bool, symbol: str | None = None) -> RulesVerdict:
     """``signal_for`` packaged for the committee prompt.
 
     The planners used to compute this and drop the reason string on the floor,
     so the model re-derived a view from the same indicators instead of reacting
     to the signal the app had already committed to.
+
+    For a holding the signal's ADD is reported as "add" rather than folded
+    into "hold" — the committee should know the house signal wants more.
     """
-    score, action, reason = signal_for(ind, held)
+    score, action, reason = signal_for(ind, held, symbol)
+    if held and ind.signal is not None and ind.signal.decide(held=True, symbol=symbol) == "ADD":
+        action = "add"
     return RulesVerdict(action=action, score=score, reason=reason)
 
 
@@ -256,7 +273,7 @@ class AutoTraderService:
                 rows.append(_Decision(sym, "skip", "no price history", None))
                 continue
             position = positions.get(sym)
-            score, action, reason = self._signal(ind, position is not None)
+            score, action, reason = self._signal(ind, position is not None, sym)
             rows.append(_Decision(sym, action, reason, score, position=position))
 
         # --- pass 2: the news guardrail ---

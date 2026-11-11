@@ -498,6 +498,14 @@ class ActionOut(BaseModel):
     projected_weight: float
     confidence: float
     reason: str
+    # The composite trend/momentum score (-1..+1) the verdict was anchored to,
+    # and its one-line breakdown. None for a listing too new to score.
+    signal_score: float | None = None
+    signal: str | None = None
+    # Where the price came from ("broker:Wealthsimple", "yahoo", "position
+    # value") and when it was struck (ISO 8601, UTC).
+    price_source: str | None = None
+    price_as_of: str | None = None
 
 
 class ActionHoldOut(BaseModel):
@@ -508,6 +516,8 @@ class ActionHoldOut(BaseModel):
     weight: float
     confidence: float
     reason: str
+    signal_score: float | None = None
+    signal: str | None = None
 
 
 class PlanFactorOut(BaseModel):
@@ -574,7 +584,29 @@ class ActionPlanOut(BaseModel):
     note: str
     research: ResearchOut | None = None
     factors: FactorPlanOut | None = None
+    # The trading day the plan's signals were computed for. Asking again in
+    # the same period with the same holdings returns the same plan.
+    period: str | None = None
     disclaimer: str = INVEST_DISCLAIMER
+
+
+class ActionRunIn(ActionPlanIn):
+    # Build a fresh plan even when one already exists for this period and
+    # these inputs. Committee verdicts are still the day's cached ones.
+    force: bool = False
+
+
+class ActionRunOut(BaseModel):
+    id: str
+    status: str  # running | done | failed
+    period: str
+    request: dict
+    result: ActionPlanOut | None = None
+    error: str | None = None
+    created_at: str
+    finished_at: str | None = None
+    # True when this is an earlier plan returned instead of building a new one.
+    reused: bool = False
 
 
 class ActionOrderIn(BaseModel):

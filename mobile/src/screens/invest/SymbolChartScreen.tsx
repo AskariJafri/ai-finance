@@ -14,6 +14,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useCandles } from "../../api/hooks";
 import { Card } from "../../components/Card";
+import { TradingViewChart } from "../../components/TradingViewChart";
 import { CandleChart } from "../../components/charts/CandleChart";
 import { useTheme } from "../../theme";
 import { formatCurrency, formatPercent } from "../../utils/format";
@@ -171,6 +172,17 @@ export function SymbolChartScreen() {
             : "Updates about once a minute while this screen is open."}
           {data?.market_state ? `  Market: ${data.market_state.toLowerCase()}.` : ""}
         </Text>
+
+        <Card>
+          <Text style={{ color: theme.colors.text, fontSize: 16, fontWeight: "700" }}>
+            Live chart
+          </Text>
+          <Text style={{ color: theme.colors.textMuted, fontSize: 11, marginTop: 2, marginBottom: 10 }}>
+            Streaming from TradingView. For viewing only — plans are priced from
+            your brokerage's live quote where linked.
+          </Text>
+          {symbol ? <TradingViewChart symbol={symbol} /> : null}
+        </Card>
         {data?.disclaimer ? (
           <Text style={{ color: theme.colors.textMuted, fontSize: 11, lineHeight: 16 }}>
             {data.disclaimer}
