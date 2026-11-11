@@ -1,0 +1,8 @@
+# Local dev settings (LAN API address) must never ship to the hosted web app:
+# without them the build falls back to app.json extra.apiBaseUrl, the
+# production API.
+.env
+.env.local
+node_modules
+.expo
+dist
