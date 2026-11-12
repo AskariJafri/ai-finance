@@ -15,6 +15,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import {
   useAcceptActionPlan,
   useBrokerageConnections,
+  useActionRunStarting,
   useLatestActionRun,
   usePortfolio,
   useStartActionRun,
@@ -48,7 +49,10 @@ export function ActionsScreen() {
   // is — still building, finished, failed — is what we show, so leaving and
   // coming back (or switching apps) picks up exactly where it was.
   const runState = latest.data ?? null;
-  const building = start.isPending || runState?.status === "running";
+  // App-wide, not this screen's own mutation: a plan started before the user
+  // pressed back is still "starting" when they return.
+  const starting = useActionRunStarting();
+  const building = starting || runState?.status === "running";
   const result = !building && runState?.status === "done" ? runState.result : null;
   const failed = !building && runState?.status === "failed" ? runState.error : null;
 

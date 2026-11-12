@@ -10,7 +10,12 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-import { useAnalyzeStock, useCommitteeSessions } from "../../api/hooks";
+import {
+  ANALYZE_KEY,
+  useAnalyzeStock,
+  useCommitteeSessions,
+  useLastMutation,
+} from "../../api/hooks";
 import { AgentTake, CommitteeResult } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
@@ -22,7 +27,10 @@ export function CommitteeScreen() {
   const analyze = useAnalyzeStock();
   const sessions = useCommitteeSessions();
   const [symbol, setSymbol] = useState("");
-  const [result, setResult] = useState<CommitteeResult | null>(null);
+  // From the app-wide cache: the analysis keeps going if you press back, and
+  // its verdict is still here when you return.
+  const last = useLastMutation<CommitteeResult>(ANALYZE_KEY);
+  const result = last.data ?? null;
 
   const verdictColor = (action: string) =>
     action === "BUY"
@@ -42,7 +50,7 @@ export function CommitteeScreen() {
     const sym = symbol.trim().toUpperCase();
     if (!sym) return;
     analyze.mutate(sym, {
-      onSuccess: (r) => setResult(r),
+
       onError: (err: any) =>
         alert(
           "Couldn't analyze",
@@ -79,10 +87,10 @@ export function CommitteeScreen() {
               },
             ]}
           />
-          <Button title="Analyze" onPress={run} loading={analyze.isPending} style={styles.btn} />
+          <Button title="Analyze" onPress={run} loading={last.isPending} style={styles.btn} />
         </View>
 
-        {analyze.isPending ? (
+        {last.isPending ? (
           <Card>
             <View style={styles.pending}>
               <ActivityIndicator color={theme.colors.primary} />

@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useIsMutating,
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import { useSession } from "../stores/session";
 import { api } from "./client";
@@ -256,10 +262,42 @@ export function useSetBudgetSettings() {
   });
 }
 
+// --- long-running requests that must survive leaving the screen ---
+/**
+ * Keep a finished result around this long after the last screen showing it
+ * closed (the default is five minutes).
+ */
+const KEEP_RESULT_MS = 60 * 60 * 1000;
+
+/**
+ * The latest run of a keyed mutation, readable from any screen.
+ *
+ * A mutation's own `isPending`/`data` belong to the component that called
+ * it, so pressing back used to throw away a minute-long AI request's progress
+ * and its answer. The mutation itself lives in the app-wide cache and keeps
+ * running; this reads it from there, so a screen opened later shows the same
+ * "working…" or the same result.
+ */
+export function useLastMutation<TData, TVars = unknown>(mutationKey: readonly unknown[]) {
+  const states = useMutationState({ filters: { mutationKey }, select: (m) => m.state });
+  const last = states[states.length - 1];
+  return {
+    data: last?.status === "success" ? (last.data as TData) : undefined,
+    error: last?.status === "error" ? last.error : null,
+    isPending: last?.status === "pending",
+    variables: last?.variables as TVars | undefined,
+  };
+}
+
+export const ANALYZE_KEY = ["invest", "committee", "analyze"];
+export const DEPLOY_PLAN_KEY = ["invest", "deploy", "propose"];
+
 // --- Invest: AI committee ---
 export function useAnalyzeStock() {
   const qc = useQueryClient();
   return useMutation({
+    mutationKey: ANALYZE_KEY,
+    gcTime: KEEP_RESULT_MS,
     mutationFn: async (symbol: string) =>
       (
         await api.post<CommitteeResult>(
@@ -522,6 +560,8 @@ export function useProposeRebalance() {
  */
 export function useDeployPlan() {
   return useMutation({
+    mutationKey: DEPLOY_PLAN_KEY,
+    gcTime: KEEP_RESULT_MS,
     mutationFn: async (body: DeployPlanRequest) =>
       (await api.post<DeployPlan>("/invest/deploy/propose", body, { timeout: 180_000 }))
         .data,
@@ -546,36 +586,61 @@ export function useAcceptDeployPlan() {
  * screen, switch tabs or switch apps: when you come back this picks the run
  * up where it is. Polls every few seconds only while a run is in progress.
  */
+const LATEST_RUN_KEY = ["invest", "actions", "latest"];
+/**
+ * Shared by every screen. Mutation state lives in the app-wide client, not in
+ * the component that called `mutate`, so "a plan is starting" survives that
+ * screen being popped off the stack with the back button.
+ */
+const START_RUN_KEY = ["invest", "actions", "start"];
+
+/** True while a "Build my plan" request is still outstanding, app-wide. */
+export function useActionRunStarting(): boolean {
+  return useIsMutating({ mutationKey: START_RUN_KEY }) > 0;
+}
+
 export function useLatestActionRun() {
+  const starting = useActionRunStarting();
   return useQuery({
-    queryKey: ["invest", "actions", "latest"],
+    queryKey: LATEST_RUN_KEY,
     queryFn: async () =>
       (await api.get<ActionRun | null>("/invest/actions/runs/latest")).data ?? null,
     staleTime: 0,
+    // Keep checking while a start request is outstanding as well as while the
+    // run reports "running". On a serverless host that request stays open
+    // until the plan is finished, and the server may not have registered the
+    // new run the first time we look; stopping on that first look is what
+    // made the progress vanish after leaving the screen.
     refetchInterval: (query) =>
-      (query.state.data as ActionRun | null | undefined)?.status === "running" ? 3_000 : false,
+      starting || (query.state.data as ActionRun | null | undefined)?.status === "running"
+        ? 3_000
+        : false,
   });
 }
 
+/** Whether a plan is being built right now — on the server or still starting. */
+export function useActionRunBuilding(): boolean {
+  const starting = useActionRunStarting();
+  const { data } = useLatestActionRun();
+  return starting || data?.status === "running";
+}
+
 /**
- * Start a plan. Returns at once with the run (or the day's existing plan for
- * the same inputs, `reused`). On a serverless host the server may hold this
- * request open until the run is done — the screen does not wait on it: it
- * polls `useLatestActionRun` either way.
+ * Start a plan. Returns the run (or the day's existing plan for the same
+ * inputs, `reused`). On a serverless host the server may hold this request
+ * open until the run is done; nothing waits on it — every screen reads
+ * `useLatestActionRun`, which keeps polling while this is outstanding.
  */
 export function useStartActionRun() {
   const qc = useQueryClient();
-  const key = ["invest", "actions", "latest"];
   return useMutation({
+    mutationKey: START_RUN_KEY,
     mutationFn: async (body: ActionPlanRequest & { force?: boolean }) =>
       (await api.post<ActionRun>("/invest/actions/runs", body, { timeout: 300_000 })).data,
-    onMutate: () => {
-      // Start polling straight away — the POST may not return until the plan
-      // is finished, and the screen should show progress before then.
-      setTimeout(() => qc.invalidateQueries({ queryKey: key }), 1_500);
-    },
-    onSuccess: (run) => qc.setQueryData(key, run),
-    onSettled: () => qc.invalidateQueries({ queryKey: key }),
+    // Hook-level callbacks run even if the screen that started the mutation
+    // has since unmounted, so the result always lands in the shared cache.
+    onSuccess: (run) => qc.setQueryData(LATEST_RUN_KEY, run),
+    onSettled: () => qc.invalidateQueries({ queryKey: LATEST_RUN_KEY }),
   });
 }
 

@@ -13,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import {
   useBrokerageConnections,
   useInvestSync,
+  useActionRunStarting,
   useLatestActionRun,
   usePortfolio,
   useSyncBrokerage,
@@ -94,12 +95,13 @@ export function InvestHomeScreen() {
   // The plan builds in the background; say so here, so it is clear the work
   // carried on after leaving that screen.
   const planRun = useLatestActionRun().data;
+  const planStarting = useActionRunStarting();
   const primary = PRIMARY.map((item) =>
-    item.screen !== "Actions" || !planRun
+    item.screen !== "Actions" || (!planRun && !planStarting)
       ? item
-      : planRun.status === "running"
+      : planStarting || planRun?.status === "running"
         ? { ...item, subtitle: "Building your plan… tap to watch" }
-        : planRun.status === "done" && planRun.result
+        : planRun?.status === "done" && planRun.result
           ? {
               ...item,
               subtitle: planRun.result.actions.length

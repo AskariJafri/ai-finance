@@ -14,10 +14,12 @@ import { useNavigation } from "@react-navigation/native";
 import {
   useAcceptDeployPlan,
   useBrokerageConnections,
+  DEPLOY_PLAN_KEY,
   useDeployPlan,
+  useLastMutation,
   usePortfolio,
 } from "../../api/hooks";
-import type { Sizing } from "../../api/types";
+import type { DeployPlan, Sizing } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Card } from "../../components/Card";
 import { useTheme } from "../../theme";
@@ -51,7 +53,10 @@ export function DeployCashScreen() {
 
   const portfolio = usePortfolio();
   const connections = useBrokerageConnections();
-  const plan = useDeployPlan();
+  const startPlan = useDeployPlan();
+  // Read from the app-wide cache, not this screen's mutation, so pressing back
+  // mid-scan and coming back still shows it working (or its answer).
+  const plan = useLastMutation<DeployPlan>(DEPLOY_PLAN_KEY);
   const accept = useAcceptDeployPlan();
 
   // A linked broker means fractional shares are buyable, and dollar sizing is
@@ -68,7 +73,7 @@ export function DeployCashScreen() {
   const run = () => {
     if (!(parsed > 0)) return;
     setShowPassed(false);
-    plan.mutate({ amount: parsed, max_positions: positions, sizing: effectiveSizing });
+    startPlan.mutate({ amount: parsed, max_positions: positions, sizing: effectiveSizing });
   };
 
   const acceptPlan = () => {
